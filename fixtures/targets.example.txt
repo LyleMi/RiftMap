@@ -1,0 +1,3 @@
+# Documentation-only ranges. Reserved test networks are always refused for live scans.
+192.0.2.0/30
+198.51.100.10

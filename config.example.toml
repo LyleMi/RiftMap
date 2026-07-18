@@ -1,0 +1,30 @@
+[scan]
+port = 22
+protocol = "ssh"
+syn_attempts = 3
+source_port = 61000
+connect_timeout_ms = 3000
+banner_timeout_ms = 5000
+banner_max_bytes = 4096
+banner_attempts = 2
+banner_concurrency = 512
+banner_connects_per_second = 200
+
+[targets]
+include = ["fixtures/targets.example.txt"]
+exclude = ["fixtures/exclude.example.txt"]
+allow_private = false
+max_targets = 25000000
+
+[network]
+interface = "eth0"
+source_ip = "auto"
+provider_egress_mbps = 100
+application_ratio = 0.80
+tc_ratio = 0.85
+require_tc = true
+accounting = "estimated-wire"
+
+[output]
+job_root = ".riftmap/jobs"
+output_all = false

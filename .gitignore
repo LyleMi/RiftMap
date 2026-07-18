@@ -1,0 +1,12 @@
+/target/
+/.riftmap/
+/targets/
+/outputs/
+config.local.toml
+*.pcap
+*.pcapng
+*.log
+*.pem
+*.key
+.env
+.DS_Store

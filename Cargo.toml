@@ -1,0 +1,47 @@
+[package]
+name = "riftmap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Rate-limited, resumable IPv4 TCP service mapper"
+
+[lib]
+name = "riftmap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "riftmap"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+blake3 = "1.5"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+memmap2 = "0.9"
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "io-util"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+pcap = "2.2"
+
+[dev-dependencies]
+proptest = "1.6"
+tempfile = "3.19"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
