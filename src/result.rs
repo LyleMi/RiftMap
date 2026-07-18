@@ -69,6 +69,23 @@ pub struct MysqlFields {
     pub connection_id: Option<u32>,
     pub capabilities: Option<u32>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SmtpFields {
+    pub code: Option<u16>,
+    pub multiline: bool,
+    pub domain: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RedisFields {
+    pub kind: Option<String>,
+    pub message: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PostgresFields {
+    pub message_type: Option<String>,
+    pub severity: Option<String>,
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultV1 {
@@ -91,6 +108,9 @@ pub struct ResultV1 {
     pub ssh: Option<SshFields>,
     pub ftp: Option<FtpFields>,
     pub mysql: Option<MysqlFields>,
+    pub smtp: Option<SmtpFields>,
+    pub redis: Option<RedisFields>,
+    pub postgres: Option<PostgresFields>,
 }
 
 pub fn result_id(scan_id: &str, ip: std::net::Ipv4Addr, port: u16) -> String {
@@ -118,6 +138,42 @@ mod tests {
         let value = encode_state_byte(TargetState::Open, 2);
 
         assert_eq!(decode_state_byte(value)?, (TargetState::Open, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn result_schema_file_is_valid_json() -> anyhow::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/result-v1.json"))?;
+
+        assert_eq!(schema["title"], "RiftMap ResultV1");
+        assert_eq!(schema["properties"]["schema_version"]["const"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_result_without_conflicts_deserializes() -> anyhow::Result<()> {
+        let result: ResultV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "result_id": "result",
+            "scan_id": "scan",
+            "ip": "10.0.0.1",
+            "port": 22,
+            "protocol": "ssh",
+            "state": "open",
+            "syn_attempts": 1,
+            "rtt_ms": 1.25,
+            "first_observed_at": null,
+            "last_observed_at": null,
+            "banner_status": "ok",
+            "banner_base64": null,
+            "banner_text": "SSH-2.0-test",
+            "ssh": null,
+            "ftp": null,
+            "mysql": null
+        }))?;
+
+        assert_eq!(result.conflicting_observations, 0);
         Ok(())
     }
 }

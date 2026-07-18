@@ -31,8 +31,14 @@ target/release/riftmap tc-template -c config.local.toml
 sudo target/release/riftmap doctor -c config.local.toml
 sudo target/release/riftmap scan -c config.local.toml --dry-run
 sudo target/release/riftmap scan -c config.local.toml
+sudo target/release/riftmap scan -c config.local.toml --shard-index 0 --shard-count 4
 target/release/riftmap job status --job .riftmap/jobs/<scan-id>
+target/release/riftmap job status --job .riftmap/jobs/<scan-id> --json
+target/release/riftmap report --job .riftmap/jobs/<scan-id>
+target/release/riftmap validation-report -c config.local.toml --job .riftmap/jobs/<scan-id>
 target/release/riftmap export --job .riftmap/jobs/<scan-id>
+target/release/riftmap export --job .riftmap/jobs/<scan-id> --state open --banner-status ok --format csv
+target/release/riftmap job prune -c config.local.toml --older-than-days 30 --dry-run
 ```
 
 Use `resume` after Ctrl-C, timeout, or process failure:
@@ -43,6 +49,10 @@ sudo target/release/riftmap resume --job .riftmap/jobs/<scan-id>
 
 The job stores an immutable `config.toml`, so resume and export use the
 configuration captured when the job was created.
+
+For multi-port inventory, set `[scan].services` in the config. Each target IP is
+materialized once per `{ port, protocol }` service endpoint, and `max_targets`
+is enforced against endpoint count rather than unique IP count.
 
 ## Offline checks
 
@@ -121,15 +131,25 @@ Each scan writes `summary.json` before returning. Important fields:
 If `pcap_drops` is non-zero, treat the job as degraded. Open observations may
 still be useful, but no-response results are not reliable negatives.
 
+`[budget].time_budget_secs` is only an estimate unless
+`enforce_time_budget = true`. When enforcement is enabled, RiftMap uses the
+smaller of `budget.time_budget_secs` and `scan.max_runtime_secs` as the
+protective scan timeout.
+
+Use `report` for a compact status and inventory summary. It includes the same
+job status counters plus protocol, banner status, and software distributions
+from `events.ndjson`; add `--json` for automation.
+
 ## Export behavior
 
 `events.ndjson` is append-only and at-least-once. It may contain duplicate
 records for the same target.
 
-`export` writes `results.ndjson` by selecting the latest record for each
-deterministic `result_id` and sorting results stably. By default, only open
-targets are exported. With `output_all = true`, export also synthesizes closed,
-unreachable, and no-response records from the state files.
+`export` writes `results.ndjson` or `results.csv` by selecting the latest record
+for each deterministic `result_id` and sorting results stably. By default, only
+open targets are exported. Use `--state`, `--protocol`, and `--banner-status`
+to filter selected rows. With `output_all = true`, export also synthesizes
+closed, unreachable, and no-response records from the state files.
 
 Full export is refused when:
 
@@ -151,3 +171,8 @@ Full export is refused when:
 
 Keep `.riftmap/jobs/<scan-id>` until `results.ndjson` has been reviewed and
 archived according to your local data-handling policy.
+
+Use `job prune` only after exports have been archived. `--dry-run` prints
+candidate job directories without deleting them; without `--dry-run`, only
+directories under the configured job root that contain `checkpoint.json` are
+removed.

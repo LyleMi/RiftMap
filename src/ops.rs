@@ -6,29 +6,34 @@ use crate::{
     target,
 };
 use anyhow::Context;
+use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     fs,
+    fs::File,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct TargetReport {
     pub include_file_count: usize,
     pub exclude_file_count: usize,
     pub target_count: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct ConfigValidationReport {
     pub target_report: TargetReport,
     pub estimate: Estimate,
     pub job_root: PathBuf,
     pub allow_private: bool,
     pub max_targets: u64,
+    pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StateCounters {
     pub open: u64,
     pub closed: u64,
@@ -36,14 +41,15 @@ pub struct StateCounters {
     pub no_response: u64,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BannerCounters {
     pub queued: u64,
     pub done: u64,
     pub failed_or_incomplete: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NextAction {
     Export,
     Resume,
@@ -62,7 +68,7 @@ impl NextAction {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct JobStatus {
     pub scan_id: String,
     pub job_dir: PathBuf,
@@ -82,7 +88,8 @@ pub struct JobStatus {
     pub next_action: NextAction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobListStatus {
     Completed,
     TimedOut,
@@ -105,7 +112,7 @@ impl JobListStatus {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct JobListEntry {
     pub scan_id: Option<String>,
     pub status: JobListStatus,
@@ -118,6 +125,27 @@ pub struct JobListEntry {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CountEntry {
+    pub value: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JobReport {
+    pub status: JobStatus,
+    pub protocol_counts: Vec<CountEntry>,
+    pub banner_status_counts: Vec<CountEntry>,
+    pub software_counts: Vec<CountEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JobPruneEntry {
+    pub path: PathBuf,
+    pub updated_at: Option<u64>,
+    pub removed: bool,
+}
+
 pub fn prepare_targets(cfg: &Config) -> anyhow::Result<TargetReport> {
     let includes = target::parse_files(&cfg.targets.include)?;
     let excludes = target::parse_files(&cfg.targets.exclude)?;
@@ -128,7 +156,7 @@ pub fn prepare_targets(cfg: &Config) -> anyhow::Result<TargetReport> {
     Ok(TargetReport {
         include_file_count: cfg.targets.include.len(),
         exclude_file_count: cfg.targets.exclude.len(),
-        target_count: target::count(&ranges),
+        target_count: target::count(&ranges).saturating_mul(cfg.scan.services().len() as u64),
     })
 }
 
@@ -143,13 +171,34 @@ pub fn validate_config(path: impl AsRef<Path>) -> anyhow::Result<ConfigValidatio
     let target_report = prepare_targets(&cfg)?;
     ensure_target_count_valid(target_report.target_count, cfg.targets.max_targets)?;
     let estimate = scanner::estimate(&cfg, target_report.target_count);
+    let warnings = config_warnings(&cfg, &estimate);
     Ok(ConfigValidationReport {
         target_report,
         estimate,
         job_root: cfg.output.job_root,
         allow_private: cfg.targets.allow_private,
         max_targets: cfg.targets.max_targets,
+        warnings,
     })
+}
+
+fn config_warnings(cfg: &Config, estimate: &Estimate) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if (cfg.network.tc_ratio - cfg.network.application_ratio).abs() < f64::EPSILON {
+        warnings.push(
+            "application_ratio equals tc_ratio; leave headroom below the hard ceiling".into(),
+        );
+    } else if cfg.network.tc_ratio - cfg.network.application_ratio < 0.05 {
+        warnings
+            .push("application_ratio is within 0.05 of tc_ratio; consider more headroom".into());
+    }
+    if cfg.budget.time_budget_secs.is_some() && cfg.budget.expected_open_ratio.is_none() {
+        warnings.push("time_budget_secs is set but expected_open_ratio is missing; banner workload is unknown".into());
+    }
+    warnings.extend(estimate.budget_warnings.iter().cloned());
+    warnings.sort();
+    warnings.dedup();
+    warnings
 }
 
 fn ensure_target_count_valid(target_count: u64, max_targets: u64) -> anyhow::Result<()> {
@@ -256,6 +305,15 @@ pub fn job_list_from_config(config: impl AsRef<Path>) -> anyhow::Result<Vec<JobL
     job_list(&cfg.output.job_root)
 }
 
+pub fn job_prune_from_config(
+    config: impl AsRef<Path>,
+    older_than_days: u64,
+    dry_run: bool,
+) -> anyhow::Result<Vec<JobPruneEntry>> {
+    let cfg = Config::load(config)?;
+    job_prune(&cfg.output.job_root, older_than_days, dry_run)
+}
+
 pub fn job_list(root: impl AsRef<Path>) -> anyhow::Result<Vec<JobListEntry>> {
     let root = root.as_ref();
     if !root.exists() {
@@ -272,6 +330,131 @@ pub fn job_list(root: impl AsRef<Path>) -> anyhow::Result<Vec<JobListEntry>> {
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+pub fn job_prune(
+    root: impl AsRef<Path>,
+    older_than_days: u64,
+    dry_run: bool,
+) -> anyhow::Result<Vec<JobPruneEntry>> {
+    anyhow::ensure!(older_than_days > 0, "older_than_days must be positive");
+    let root = root.as_ref();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff = now.saturating_sub(older_than_days.saturating_mul(86_400));
+    job_prune_before(root, cutoff, dry_run)
+}
+
+fn job_prune_before(
+    root: impl AsRef<Path>,
+    cutoff: u64,
+    dry_run: bool,
+) -> anyhow::Result<Vec<JobPruneEntry>> {
+    let mut pruned = Vec::new();
+    for entry in job_list(root)? {
+        let Some(updated_at) = entry.updated_at else {
+            continue;
+        };
+        if updated_at > cutoff {
+            continue;
+        }
+        if !dry_run {
+            fs::remove_dir_all(&entry.path)
+                .with_context(|| format!("remove {}", entry.path.display()))?;
+        }
+        pruned.push(JobPruneEntry {
+            path: entry.path,
+            updated_at: Some(updated_at),
+            removed: !dry_run,
+        });
+    }
+    Ok(pruned)
+}
+
+pub fn job_report(dir: impl AsRef<Path>) -> anyhow::Result<JobReport> {
+    let dir = dir.as_ref();
+    let status = job_status(dir)?;
+    let mut protocol_counts = BTreeMap::new();
+    let mut banner_status_counts = BTreeMap::new();
+    let mut software_counts = BTreeMap::new();
+    let events = dir.join("events.ndjson");
+    if events.exists() {
+        for (i, line) in BufReader::new(File::open(events)?).lines().enumerate() {
+            let line = line?;
+            let result: crate::ResultV1 =
+                serde_json::from_str(&line).with_context(|| format!("event line {}", i + 1))?;
+            *protocol_counts
+                .entry(json_name(result.protocol)?)
+                .or_insert(0) += 1;
+            if let Some(status) = result.banner_status {
+                *banner_status_counts.entry(json_name(status)?).or_insert(0) += 1;
+            }
+            if let Some(software) = software_label(&result) {
+                *software_counts.entry(software).or_insert(0) += 1;
+            }
+        }
+    }
+    Ok(JobReport {
+        status,
+        protocol_counts: count_entries(protocol_counts),
+        banner_status_counts: count_entries(banner_status_counts),
+        software_counts: count_entries(software_counts),
+    })
+}
+
+fn software_label(result: &crate::ResultV1) -> Option<String> {
+    if let Some(ssh) = &result.ssh {
+        if let Some(version) = &ssh.software_version {
+            return Some(format!("ssh:{version}"));
+        }
+    }
+    if let Some(mysql) = &result.mysql {
+        if let Some(version) = &mysql.server_version {
+            return Some(format!("mysql:{version}"));
+        }
+    }
+    if let Some(smtp) = &result.smtp {
+        if let Some(domain) = &smtp.domain {
+            return Some(format!("smtp:{domain}"));
+        }
+    }
+    if let Some(redis) = &result.redis {
+        if let Some(message) = &redis.message {
+            return Some(format!("redis:{message}"));
+        }
+    }
+    if let Some(postgres) = &result.postgres {
+        if let Some(message_type) = &postgres.message_type {
+            return Some(format!("postgres:{message_type}"));
+        }
+    }
+    if let Some(ftp) = &result.ftp {
+        if let Some(code) = ftp.code {
+            return Some(format!("ftp:{code}"));
+        }
+    }
+    result
+        .banner_text
+        .as_ref()
+        .map(|text| format!("banner:{text}"))
+}
+
+fn json_name<T: serde::Serialize>(value: T) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&value)?.trim_matches('"').to_owned())
+}
+
+fn count_entries(counts: BTreeMap<String, u64>) -> Vec<CountEntry> {
+    let mut entries: Vec<_> = counts
+        .into_iter()
+        .map(|(value, count)| CountEntry { value, count })
+        .collect();
+    entries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+    entries
 }
 
 fn job_list_entry(path: PathBuf) -> JobListEntry {
@@ -449,6 +632,7 @@ mod tests {
             scan: ScanConfig {
                 port: 22,
                 protocol: Protocol::Ssh,
+                services: vec![],
                 syn_attempts: 3,
                 source_port: 61_000,
                 connect_timeout_ms: 3_000,
@@ -656,6 +840,208 @@ job_root = "jobs"
         assert_eq!(report.target_report.target_count, 2);
         assert_eq!(report.estimate.targets, 2);
         assert_eq!(report.job_root, temp.path().join("jobs"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_config_counts_multiple_service_endpoints() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("targets.txt"), "10.0.0.1\n10.0.0.2\n")?;
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[scan]
+port = 22
+protocol = "ssh"
+services = [
+  { port = 22, protocol = "ssh" },
+  { port = 25, protocol = "smtp" },
+]
+
+[targets]
+include = ["targets.txt"]
+max_targets = 10
+allow_private = true
+
+[network]
+interface = "lo"
+source_ip = "127.0.0.1"
+require_tc = false
+
+[output]
+job_root = "jobs"
+"#,
+        )?;
+
+        let report = validate_config(&config_path)?;
+
+        assert_eq!(report.target_report.target_count, 4);
+        assert_eq!(report.estimate.targets, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn validate_config_rejects_duplicate_service_ports() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("targets.txt"), "10.0.0.1\n")?;
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[scan]
+port = 22
+protocol = "ssh"
+services = [
+  { port = 22, protocol = "ssh" },
+  { port = 22, protocol = "smtp" },
+]
+
+[targets]
+include = ["targets.txt"]
+max_targets = 10
+allow_private = true
+
+[network]
+interface = "lo"
+source_ip = "127.0.0.1"
+require_tc = false
+
+[output]
+job_root = "jobs"
+"#,
+        )?;
+
+        assert!(
+            validate_config(&config_path)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate scan service port 22")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_config_reports_lint_warnings() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("targets.txt"), "10.0.0.1\n")?;
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[scan]
+port = 22
+protocol = "ssh"
+
+[budget]
+time_budget_secs = 7200
+
+[targets]
+include = ["targets.txt"]
+max_targets = 10
+allow_private = true
+
+[network]
+interface = "lo"
+source_ip = "127.0.0.1"
+application_ratio = 0.85
+tc_ratio = 0.85
+require_tc = false
+
+[output]
+job_root = "jobs"
+"#,
+        )?;
+
+        let report = validate_config(&config_path)?;
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("application_ratio equals tc_ratio"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("expected_open_ratio"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn job_report_summarizes_events() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let include = temp.path().join("targets.txt");
+        fs::write(&include, "10.0.0.1\n")?;
+        let cfg = config(temp.path(), include, 10);
+        let mut job = PreparedJob::create(&cfg, Some([6; 32]))?;
+        job.meta.round = cfg.scan.syn_attempts;
+        job.checkpoint(job.meta.target_count)?;
+        job::save_summary(&job.dir, &summary(true, false, 0))?;
+        let ip = "10.0.0.1".parse()?;
+        job::append_event(
+            &job.dir,
+            &crate::ResultV1 {
+                schema_version: crate::SCHEMA_VERSION,
+                result_id: crate::result::result_id(&job.meta.scan_id, ip, cfg.scan.port),
+                scan_id: job.meta.scan_id.clone(),
+                ip,
+                port: cfg.scan.port,
+                protocol: cfg.scan.protocol,
+                state: TargetState::Open,
+                syn_attempts: 1,
+                rtt_ms: Some(1.0),
+                conflicting_observations: 0,
+                first_observed_at: None,
+                last_observed_at: None,
+                banner_status: Some(crate::BannerStatus::Ok),
+                banner_base64: None,
+                banner_text: None,
+                ssh: Some(crate::result::SshFields {
+                    protocol_version: Some("2.0".into()),
+                    software_version: Some("OpenSSH_9.6".into()),
+                    comments: None,
+                }),
+                ftp: None,
+                mysql: None,
+                smtp: None,
+                redis: None,
+                postgres: None,
+            },
+        )?;
+
+        let report = job_report(&job.dir)?;
+
+        assert_eq!(report.protocol_counts[0].value, "ssh");
+        assert_eq!(report.banner_status_counts[0].value, "ok");
+        assert_eq!(report.software_counts[0].value, "ssh:OpenSSH_9.6");
+        assert!(report.status.completed);
+        Ok(())
+    }
+
+    #[test]
+    fn job_prune_removes_only_checkpoint_jobs_before_cutoff() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let include = temp.path().join("targets.txt");
+        fs::write(&include, "10.0.0.1\n")?;
+        let cfg = config(temp.path(), include, 10);
+        let job = PreparedJob::create(&cfg, Some([7; 32]))?;
+        let keep = temp.path().join("not-a-job");
+        fs::create_dir_all(&keep)?;
+
+        let dry_run = job_prune_before(temp.path(), u64::MAX, true)?;
+        assert_eq!(dry_run.len(), 1);
+        assert!(!dry_run[0].removed);
+        assert!(job.dir.exists());
+
+        let removed = job_prune_before(temp.path(), u64::MAX, false)?;
+
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].removed);
+        assert!(!job.dir.exists());
+        assert!(keep.exists());
         Ok(())
     }
 

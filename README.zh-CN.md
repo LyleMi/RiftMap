@@ -1,8 +1,8 @@
 # RiftMap
 
 RiftMap 是用于获授权资产盘点的 Linux IPv4 TCP 服务测绘工具。它使用原始
-SYN 做端口发现，再通过内核 TCP 连接被动读取 SSH、FTP 或 MySQL 的服务端首个
-完整消息；不会发送客户端协议数据。
+SYN 做端口发现，再通过内核 TCP 连接被动读取 SSH、FTP、MySQL、SMTP、Redis 或
+Postgres 的服务端首个完整消息；不会发送客户端协议数据。
 
 > 只能扫描自有或明确获授权的地址。云厂商政策、当地法律和目标文件均由操作者
 > 负责确认。
@@ -33,10 +33,18 @@ riftmap tc-template -c config.local.toml
 riftmap doctor -c config.local.toml
 riftmap scan -c config.local.toml --dry-run
 riftmap scan -c config.local.toml
+riftmap scan -c config.local.toml --shard-index 0 --shard-count 4
 riftmap job list -c config.local.toml
+riftmap job list -c config.local.toml --json
 riftmap job status --job .riftmap/jobs/<scan-id>
+riftmap job status --job .riftmap/jobs/<scan-id> --json
+riftmap report --job .riftmap/jobs/<scan-id>
+riftmap report --job .riftmap/jobs/<scan-id> --json
+riftmap validation-report -c config.local.toml --job .riftmap/jobs/<scan-id>
 riftmap resume --job .riftmap/jobs/<scan-id>
 riftmap export --job .riftmap/jobs/<scan-id>
+riftmap export --job .riftmap/jobs/<scan-id> --state open --banner-status ok --format csv
+riftmap job prune -c config.local.toml --older-than-days 30 --dry-run
 ```
 
 完整操作手册见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)。
@@ -50,26 +58,39 @@ riftmap export --job .riftmap/jobs/<scan-id>
 会被拒绝。默认应用预算是套餐出口的 80%，建议的 TBF 硬上限为 85%。raw SYN
 发现和 banner TCP 连接尝试共享同一个应用 token bucket；banner 采集仍保留
 单独配置的 CPS 和并发限制。若 pcap 发生丢包，任务会标记为 degraded，此时
-不能把无响应当成可靠的阴性结论。
+不能把无响应当成可靠的阴性结论。`budget.enforce_time_budget=true` 会让扫描在
+`time_budget_secs` 到达时保护性停止；也可以用 `scan.max_runtime_secs` 设置独立
+运行时上限。
 
-任务目录保存不可变配置、随机 seed、目标摘要、网络序 `targets.bin`、每目标一
-字节的 `state.bin` 和原子更新的 `checkpoint.json`。正常结束或中断的扫描还会将
+任务目录保存不可变配置、随机 seed、目标摘要、网络序 endpoint 文件
+`targets.bin`、`ports.bin`、`protocols.bin`、每 endpoint 一字节的 `state.bin`
+和原子更新的 `checkpoint.json`。正常结束或中断的扫描还会将
 累计计数和完成状态原子写入 `summary.json`。通过 cookie 验证的 SYN-ACK、RST
 和 ICMP 响应会持久化观测到的 SYN 尝试轮次、RTT 和冲突观察计数，用于导出。
 Linux 下，`summary.json` 还会记录 raw 发现和 banner 采集期间的接口 TX 包数
 与字节数增量。raw SYN 包会使用绑定接口 MTU 派生出的 MSS，并通过 `sendmmsg`
 批量发送。事件日志采用至少一次写入；
 `export` 按确定性 `result_id` 去重并稳定输出。默认结果只包含出现过可信
-SYN-ACK 的目标。启用 `output_all=true` 后，已完成任务还会为没有事件的目标
-合成关闭、不可达和无响应结果；未完成任务会拒绝全量导出，避免把尚未发送的
-目标误判为无响应。pcap 丢包导致的 degraded 任务也会拒绝 `output_all=true`，
-因为此时不能把无响应当成可靠的阴性结论。
+SYN-ACK 的目标，也可以按 state、protocol 和 banner status 过滤，并输出
+`results.ndjson` 或 `results.csv`。启用 `output_all=true` 后，已完成任务还会
+为没有事件的目标合成关闭、不可达和无响应结果；未完成任务会拒绝全量导出，
+避免把尚未发送的目标误判为无响应。pcap 丢包导致的 degraded 任务也会拒绝
+`output_all=true`，因为此时不能把无响应当成可靠的阴性结论。`job status` 和
+`job list` 支持 `--json` 供调度器和资产流水线使用。显式分片可通过
+`scan --shard-index N --shard-count M` 使用；每个分片只物化自己负责的确定性
+endpoint 子集，并在 `checkpoint.json` 中记录分片元数据。
+`report` 会基于事件日志汇总任务状态、协议、banner 状态和软件版本分布。
 
 更多文档：
 
 - [`docs/SAFETY_MODEL.md`](docs/SAFETY_MODEL.md)：目标过滤、阴性结果和限速安全假设。
 - [`docs/RESULT_SCHEMA.md`](docs/RESULT_SCHEMA.md)：`events.ndjson`、`results.ndjson`
   和 `summary.json` 字段。
+- [`docs/VALIDATION.md`](docs/VALIDATION.md)：smoke test、native Linux 验证证据和
+  lab artifact 采集脚本。
+- [`docs/VALIDATION_RESULTS.md`](docs/VALIDATION_RESULTS.md)：当前仓库状态已产出的
+  验证证据。
+- [`docs/SAMPLE_OUTPUT.md`](docs/SAMPLE_OUTPUT.md)：代表性的 CLI 输出示例。
 - [`docs/ROADMAP.md`](docs/ROADMAP.md)：已知特性缺口和验证缺口。
 
 Rust MSRV 为 1.85，仅在 CI 固定版本，不强制覆盖本机工具链。运行目标为

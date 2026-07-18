@@ -1,6 +1,14 @@
 [scan]
 port = 22
 protocol = "ssh"
+# Optional multi-service mode. When set, each target IP is scanned once per
+# service endpoint. The legacy port/protocol fields above remain for single
+# service configs and older jobs.
+# services = [
+#   { port = 22, protocol = "ssh" },
+#   { port = 25, protocol = "smtp" },
+#   { port = 3306, protocol = "mysql" },
+# ]
 syn_attempts = 3
 source_port = 61000
 connect_timeout_ms = 3000
@@ -17,6 +25,8 @@ banner_queue_capacity = 8192
 # Optional estimation inputs for large jobs.
 # time_budget_secs = 7200
 # expected_open_ratio = 0.01
+# Set true to stop the scan when time_budget_secs is reached.
+enforce_time_budget = false
 
 [targets]
 include = ["fixtures/targets.example.txt"]

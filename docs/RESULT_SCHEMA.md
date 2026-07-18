@@ -15,7 +15,9 @@ append-friendly and intended for downstream inventory pipelines.
 
 ## Result records
 
-Each line in `events.ndjson` and `results.ndjson` is a `ResultV1` object.
+Each line in `events.ndjson` and `results.ndjson` is a `ResultV1` object. The
+versioned JSON Schema is published at
+[`schemas/result-v1.json`](../schemas/result-v1.json).
 
 Common fields:
 
@@ -24,7 +26,8 @@ Common fields:
 - `scan_id`: job ID.
 - `ip`: target IPv4 address.
 - `port`: scanned TCP port.
-- `protocol`: configured protocol, one of `ssh`, `ftp`, or `mysql`.
+- `protocol`: configured protocol, one of `ssh`, `ftp`, `mysql`, `smtp`,
+  `redis`, or `postgres`.
 - `state`: one of `open`, `closed`, `unreachable`, or `no_response`.
 - `syn_attempts`: SYN attempt number where the state was observed. Synthesized
   no-response records use the configured maximum.
@@ -43,6 +46,10 @@ Banner fields:
 - `ssh`: SSH-specific parsed fields.
 - `ftp`: FTP-specific parsed fields.
 - `mysql`: MySQL-specific parsed fields.
+- `smtp`: SMTP-specific parsed fields.
+- `redis`: Redis RESP-specific parsed fields for unsolicited responses.
+- `postgres`: PostgreSQL backend-message parsed fields for unsolicited
+  responses.
 
 Example open SSH result:
 
@@ -52,7 +59,13 @@ Example open SSH result:
 
 ## Summary fields
 
-`summary.json` contains:
+`summary.json` contains the scan-level counters described below. The versioned
+JSON Schema is published at
+[`schemas/summary-v1.json`](../schemas/summary-v1.json).
+
+When `[scan].services` contains multiple entries, target counts and state
+counters are endpoint counts: one target IP multiplied by one configured
+service port/protocol.
 
 - `completed`: true when all SYN rounds finished.
 - `sent`: cumulative raw SYN packets sent.
@@ -67,9 +80,15 @@ Example open SSH result:
 
 ## Export guarantees
 
-`results.ndjson` is stable for a given job state. Export deduplicates by
-`result_id`, sorts by `result_id`, and writes one line per selected result.
+`results.ndjson` and `results.csv` are stable for a given job state. Export
+deduplicates by `result_id`, sorts by `result_id`, and writes one row per
+selected result.
 
 Default export includes only open targets. When `output_all = true`, export
 includes synthesized records for targets without events, but only after all SYN
 rounds completed and only when pcap drops are zero.
+
+CLI filters can select by `--state`, `--protocol`, and `--banner-status`.
+`--format csv` writes `results.csv`; nested protocol-specific fields are encoded
+as JSON strings inside CSV cells so inventory tools can ingest core columns
+without losing detailed fields.

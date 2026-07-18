@@ -37,9 +37,11 @@ TCP connections and waits for passive, server-first banners for the configured
 protocol. RiftMap does not send client protocol data, authentication material,
 exploit payloads, or vulnerability checks.
 
-Current protocol support is intentionally narrow: SSH, FTP, and MySQL. IPv6,
-UDP, TLS handshakes, active application probes, authentication, distributed
-shards, and vulnerability detection are outside the current implementation.
+Current protocol support is intentionally narrow: SSH, FTP, MySQL, SMTP, Redis,
+and Postgres. Redis and Postgres usually do not emit a useful server-first
+banner, so RiftMap only parses unsolicited server data when present. IPv6, UDP,
+TLS handshakes, active application probes, authentication, and vulnerability
+detection are outside the current implementation.
 
 ## Negative results
 

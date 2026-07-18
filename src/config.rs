@@ -60,12 +60,23 @@ pub enum Protocol {
     Ssh,
     Ftp,
     Mysql,
+    Smtp,
+    Redis,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceConfig {
+    pub port: u16,
+    pub protocol: Protocol,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanConfig {
     pub port: u16,
     pub protocol: Protocol,
+    #[serde(default)]
+    pub services: Vec<ServiceConfig>,
     #[serde(default = "d_syn_attempts")]
     pub syn_attempts: u8,
     #[serde(default = "d_source_port")]
@@ -88,12 +99,27 @@ pub struct ScanConfig {
     pub max_runtime_secs: Option<u64>,
 }
 
+impl ScanConfig {
+    pub fn services(&self) -> Vec<ServiceConfig> {
+        if self.services.is_empty() {
+            vec![ServiceConfig {
+                port: self.port,
+                protocol: self.protocol,
+            }]
+        } else {
+            self.services.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetConfig {
     #[serde(default)]
     pub time_budget_secs: Option<u64>,
     #[serde(default)]
     pub expected_open_ratio: Option<f64>,
+    #[serde(default)]
+    pub enforce_time_budget: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,10 +209,21 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.scan.source_port != 0, "source_port must be non-zero");
+        let services = self.scan.services();
         anyhow::ensure!(
-            self.scan.port != 0 && self.scan.source_port != 0,
-            "ports must be non-zero"
+            !services.is_empty(),
+            "at least one scan service is required"
         );
+        let mut ports = std::collections::BTreeSet::new();
+        for service in &services {
+            anyhow::ensure!(service.port != 0, "scan service ports must be non-zero");
+            anyhow::ensure!(
+                ports.insert(service.port),
+                "duplicate scan service port {}",
+                service.port
+            );
+        }
         anyhow::ensure!(
             (1..=3).contains(&self.scan.syn_attempts),
             "syn_attempts must be 1..=3"
@@ -234,6 +271,10 @@ impl Config {
         if let Some(time_budget_secs) = self.budget.time_budget_secs {
             anyhow::ensure!(time_budget_secs > 0, "time_budget_secs must be positive");
         }
+        anyhow::ensure!(
+            !self.budget.enforce_time_budget || self.budget.time_budget_secs.is_some(),
+            "enforce_time_budget requires time_budget_secs"
+        );
         if let Some(expected_open_ratio) = self.budget.expected_open_ratio {
             anyhow::ensure!(
                 (0.0..=1.0).contains(&expected_open_ratio),

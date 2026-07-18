@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://riftmap.local/schemas/result-v1.json",
+  "title": "RiftMap ResultV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "result_id",
+    "scan_id",
+    "ip",
+    "port",
+    "protocol",
+    "state",
+    "syn_attempts",
+    "rtt_ms",
+    "first_observed_at",
+    "last_observed_at",
+    "banner_status",
+    "banner_base64",
+    "banner_text",
+    "ssh",
+    "ftp",
+    "mysql",
+    "smtp",
+    "redis",
+    "postgres"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "result_id": { "type": "string", "minLength": 1 },
+    "scan_id": { "type": "string", "minLength": 1 },
+    "ip": { "type": "string", "format": "ipv4" },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "protocol": { "enum": ["ssh", "ftp", "mysql", "smtp", "redis", "postgres"] },
+    "state": { "enum": ["no_response", "unreachable", "closed", "open"] },
+    "syn_attempts": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "rtt_ms": { "type": ["number", "null"], "minimum": 0 },
+    "conflicting_observations": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "first_observed_at": { "type": ["string", "null"] },
+    "last_observed_at": { "type": ["string", "null"] },
+    "banner_status": {
+      "enum": ["ok", "connect_failed", "timeout", "protocol_mismatch", "oversized", null]
+    },
+    "banner_base64": { "type": ["string", "null"] },
+    "banner_text": { "type": ["string", "null"] },
+    "ssh": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "type": ["string", "null"] },
+        "software_version": { "type": ["string", "null"] },
+        "comments": { "type": ["string", "null"] }
+      }
+    },
+    "ftp": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "multiline": { "type": "boolean" }
+      }
+    },
+    "mysql": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "type": ["integer", "null"], "minimum": 0, "maximum": 255 },
+        "server_version": { "type": ["string", "null"] },
+        "connection_id": { "type": ["integer", "null"], "minimum": 0 },
+        "capabilities": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "smtp": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "multiline": { "type": "boolean" },
+        "domain": { "type": ["string", "null"] }
+      }
+    },
+    "redis": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": ["string", "null"] },
+        "message": { "type": ["string", "null"] }
+      }
+    },
+    "postgres": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "message_type": { "type": ["string", "null"] },
+        "severity": { "type": ["string", "null"] },
+        "message": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-use crate::result::{FtpFields, MysqlFields, SshFields};
+use crate::result::{FtpFields, MysqlFields, PostgresFields, RedisFields, SmtpFields, SshFields};
 use crate::{BannerStatus, Protocol};
 
 #[derive(Debug, Clone, Default)]
@@ -7,6 +7,9 @@ pub struct ParsedBanner {
     pub ssh: Option<SshFields>,
     pub ftp: Option<FtpFields>,
     pub mysql: Option<MysqlFields>,
+    pub smtp: Option<SmtpFields>,
+    pub redis: Option<RedisFields>,
+    pub postgres: Option<PostgresFields>,
 }
 
 pub fn message_len(
@@ -20,20 +23,25 @@ pub fn message_len(
     match protocol {
         Protocol::Ssh => Ok(data.iter().position(|&b| b == b'\n').map(|i| i + 1)),
         Protocol::Ftp => ftp_len(data),
-        Protocol::Mysql => {
-            if data.len() < 4 {
-                return Ok(None);
-            }
-            let n = data[0] as usize | ((data[1] as usize) << 8) | ((data[2] as usize) << 16);
-            let total = n.checked_add(4).ok_or(BannerStatus::Oversized)?;
-            if total > max {
-                Err(BannerStatus::Oversized)
-            } else if data.len() >= total {
-                Ok(Some(total))
-            } else {
-                Ok(None)
-            }
-        }
+        Protocol::Mysql => mysql_len(data, max),
+        Protocol::Smtp => smtp_len(data),
+        Protocol::Redis => redis_len(data),
+        Protocol::Postgres => postgres_len(data, max),
+    }
+}
+
+fn mysql_len(data: &[u8], max: usize) -> Result<Option<usize>, BannerStatus> {
+    if data.len() < 4 {
+        return Ok(None);
+    }
+    let n = data[0] as usize | ((data[1] as usize) << 8) | ((data[2] as usize) << 16);
+    let total = n.checked_add(4).ok_or(BannerStatus::Oversized)?;
+    if total > max {
+        Err(BannerStatus::Oversized)
+    } else if data.len() >= total {
+        Ok(Some(total))
+    } else {
+        Ok(None)
     }
 }
 
@@ -70,6 +78,70 @@ fn multiline_ftp_end(data: &[u8], first_end: usize) -> Option<usize> {
             let line_start = first_end + offset;
             line_end(&data[line_start..]).map(|length| line_start + length)
         })
+}
+
+fn smtp_len(data: &[u8]) -> Result<Option<usize>, BannerStatus> {
+    let Some(first_end) = line_end(data) else {
+        return Ok(None);
+    };
+    if data.len() < 4 || !data[..3].iter().all(u8::is_ascii_digit) {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    if data[3] == b' ' {
+        return Ok(Some(first_end));
+    }
+    if data[3] != b'-' {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    Ok(multiline_ftp_end(data, first_end))
+}
+
+fn redis_len(data: &[u8]) -> Result<Option<usize>, BannerStatus> {
+    match data.first() {
+        Some(b'+') | Some(b'-') | Some(b':') => Ok(line_end(data)),
+        Some(b'$') => redis_bulk_len(data),
+        Some(b'*') => Ok(line_end(data)),
+        Some(_) => Err(BannerStatus::ProtocolMismatch),
+        None => Ok(None),
+    }
+}
+
+fn redis_bulk_len(data: &[u8]) -> Result<Option<usize>, BannerStatus> {
+    let Some(header_end) = line_end(data) else {
+        return Ok(None);
+    };
+    let len = std::str::from_utf8(&data[1..header_end - 2])
+        .map_err(|_| BannerStatus::ProtocolMismatch)?
+        .parse::<isize>()
+        .map_err(|_| BannerStatus::ProtocolMismatch)?;
+    if len < 0 {
+        return Ok(Some(header_end));
+    }
+    let total = header_end
+        .checked_add(len as usize)
+        .and_then(|value| value.checked_add(2))
+        .ok_or(BannerStatus::Oversized)?;
+    Ok((data.len() >= total).then_some(total))
+}
+
+fn postgres_len(data: &[u8], max: usize) -> Result<Option<usize>, BannerStatus> {
+    if data.len() < 5 {
+        return Ok(None);
+    }
+    let tag = data[0];
+    if !tag.is_ascii_alphabetic() {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    let len = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
+    if len < 4 {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    let total = len.checked_add(1).ok_or(BannerStatus::Oversized)?;
+    if total > max {
+        Err(BannerStatus::Oversized)
+    } else {
+        Ok((data.len() >= total).then_some(total))
+    }
 }
 
 pub fn parse(protocol: Protocol, data: &[u8]) -> Result<ParsedBanner, BannerStatus> {
@@ -109,6 +181,9 @@ pub fn parse(protocol: Protocol, data: &[u8]) -> Result<ParsedBanner, BannerStat
             })
         }
         Protocol::Mysql => parse_mysql(data),
+        Protocol::Smtp => parse_smtp(data),
+        Protocol::Redis => parse_redis(data),
+        Protocol::Postgres => parse_postgres(data),
     }
 }
 
@@ -147,6 +222,83 @@ fn parse_mysql(data: &[u8]) -> Result<ParsedBanner, BannerStatus> {
             server_version: Some(version),
             connection_id: Some(id),
             capabilities: Some(low | high),
+        }),
+        ..Default::default()
+    })
+}
+
+fn parse_smtp(data: &[u8]) -> Result<ParsedBanner, BannerStatus> {
+    if data.len() < 3 || &data[..3] != b"220" {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    let text = String::from_utf8_lossy(data).trim_end().to_string();
+    let first_line = text.lines().next().unwrap_or_default();
+    let domain = first_line
+        .get(4..)
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(ToOwned::to_owned);
+    Ok(ParsedBanner {
+        text: Some(text),
+        smtp: Some(SmtpFields {
+            code: Some(220),
+            multiline: data.get(3) == Some(&b'-'),
+            domain,
+        }),
+        ..Default::default()
+    })
+}
+
+fn parse_redis(data: &[u8]) -> Result<ParsedBanner, BannerStatus> {
+    let text = String::from_utf8_lossy(data).trim_end().to_string();
+    let (kind, message) = match data.first() {
+        Some(b'+') => ("status", text.get(1..).unwrap_or_default().to_owned()),
+        Some(b'-') => ("error", text.get(1..).unwrap_or_default().to_owned()),
+        Some(b':') => ("integer", text.get(1..).unwrap_or_default().to_owned()),
+        Some(b'$') => ("bulk", text.clone()),
+        Some(b'*') => ("array", text.clone()),
+        _ => return Err(BannerStatus::ProtocolMismatch),
+    };
+    Ok(ParsedBanner {
+        text: Some(text),
+        redis: Some(RedisFields {
+            kind: Some(kind.into()),
+            message: Some(message),
+        }),
+        ..Default::default()
+    })
+}
+
+fn parse_postgres(data: &[u8]) -> Result<ParsedBanner, BannerStatus> {
+    let message_type = match data.first().copied() {
+        Some(b'E') => "error",
+        Some(b'N') => "notice",
+        Some(b'R') => "authentication",
+        Some(b'S') => "parameter_status",
+        Some(b'K') => "backend_key_data",
+        Some(_) => "message",
+        None => return Err(BannerStatus::ProtocolMismatch),
+    };
+    let payload = &data[5..];
+    let mut severity = None;
+    let mut message = None;
+    if data[0] == b'E' || data[0] == b'N' {
+        for field in payload
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty())
+        {
+            match field.split_first() {
+                Some((b'S', value)) => severity = Some(String::from_utf8_lossy(value).into()),
+                Some((b'M', value)) => message = Some(String::from_utf8_lossy(value).into()),
+                _ => {}
+            }
+        }
+    }
+    Ok(ParsedBanner {
+        text: message.clone(),
+        postgres: Some(PostgresFields {
+            message_type: Some(message_type.into()),
+            severity,
+            message,
         }),
         ..Default::default()
     })
@@ -199,5 +351,45 @@ mod tests {
         let fields = parse(Protocol::Mysql, &packet).unwrap().mysql.unwrap();
         assert_eq!(fields.connection_id, Some(42));
         assert_eq!(fields.capabilities, Some(0x5678_1234));
+    }
+
+    #[test]
+    fn smtp_multiline_parses_domain() {
+        let b = b"220-mail.example ESMTP ready\r\n220-PIPELINING\r\n220 done\r\n";
+        assert_eq!(message_len(Protocol::Smtp, b, 99).unwrap(), Some(b.len()));
+        let fields = parse(Protocol::Smtp, b).unwrap().smtp.unwrap();
+        assert_eq!(fields.code, Some(220));
+        assert!(fields.multiline);
+        assert_eq!(fields.domain.as_deref(), Some("mail.example"));
+    }
+
+    #[test]
+    fn redis_parses_error_line() {
+        let b = b"-ERR unknown command\r\n";
+        assert_eq!(message_len(Protocol::Redis, b, 99).unwrap(), Some(b.len()));
+        let fields = parse(Protocol::Redis, b).unwrap().redis.unwrap();
+        assert_eq!(fields.kind.as_deref(), Some("error"));
+        assert_eq!(fields.message.as_deref(), Some("ERR unknown command"));
+    }
+
+    #[test]
+    fn postgres_parses_error_response() {
+        let payload = b"SERROR\0Mbad startup\0\0";
+        let len = (payload.len() + 4) as u32;
+        let mut packet = vec![b'E'];
+        packet.extend_from_slice(&len.to_be_bytes());
+        packet.extend_from_slice(payload);
+
+        assert_eq!(
+            message_len(Protocol::Postgres, &packet, 99).unwrap(),
+            Some(packet.len())
+        );
+        let fields = parse(Protocol::Postgres, &packet)
+            .unwrap()
+            .postgres
+            .unwrap();
+        assert_eq!(fields.message_type.as_deref(), Some("error"));
+        assert_eq!(fields.severity.as_deref(), Some("ERROR"));
+        assert_eq!(fields.message.as_deref(), Some("bad startup"));
     }
 }

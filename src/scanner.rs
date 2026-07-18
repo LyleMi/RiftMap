@@ -95,7 +95,7 @@ pub fn estimate(cfg: &Config, count: u64) -> Estimate {
         budget_warnings,
     }
 }
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct Estimate {
     pub targets: u64,
     pub worst_packets: u64,
@@ -118,11 +118,17 @@ pub fn dry_run(job: &PreparedJob) -> anyhow::Result<String> {
     let seed = crate::job::decode_seed(&job.meta.seed_hex)?;
     let p = Permutation::new(job.meta.target_count, seed)?;
     let file = File::open(job.dir.join("targets.bin"))?;
+    let port_file = File::open(job.dir.join("ports.bin"))?;
+    let protocol_file = File::open(job.dir.join("protocols.bin"))?;
     let targets = unsafe { Mmap::map(&file)? };
+    let ports = unsafe { Mmap::map(&port_file)? };
+    let protocols = unsafe { Mmap::map(&protocol_file)? };
     let mut h = blake3::Hasher::new();
     for i in 0..job.meta.target_count {
         let index = p.get(i) as usize;
         h.update(&targets[index * 4..index * 4 + 4]);
+        h.update(&ports[index * 2..index * 2 + 2]);
+        h.update(&protocols[index..index + 1]);
     }
     Ok(h.finalize().to_hex().to_string())
 }
@@ -221,6 +227,20 @@ pub fn scan(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> 
     }
 }
 
+fn effective_runtime_limit_secs(cfg: &Config) -> Option<u64> {
+    let budget = cfg
+        .budget
+        .enforce_time_budget
+        .then_some(cfg.budget.time_budget_secs)
+        .flatten();
+    match (cfg.scan.max_runtime_secs, budget) {
+        (Some(scan), Some(budget)) => Some(scan.min(budget)),
+        (Some(scan), None) => Some(scan),
+        (None, Some(budget)) => Some(budget),
+        (None, None) => None,
+    }
+}
+
 async fn banner_pipeline(
     job_dir: PathBuf,
     receiver: std::sync::mpsc::Receiver<Option<OpenTarget>>,
@@ -252,6 +272,7 @@ async fn banner_pipeline(
                         target.ip,
                         source_ip,
                         &scan,
+                        target.service,
                         target.observation,
                         &budget,
                     )
@@ -295,6 +316,7 @@ async fn drain_completed_banner_tasks(
 struct OpenTarget {
     index: usize,
     ip: Ipv4Addr,
+    service: crate::config::ServiceConfig,
     observation: SynObservation,
 }
 
@@ -343,6 +365,7 @@ async fn inspect_banner(
     ip: Ipv4Addr,
     source_ip: Ipv4Addr,
     scan: &crate::config::ScanConfig,
+    service: crate::config::ServiceConfig,
     syn: SynObservation,
     budget: &AsyncTokenBucket,
 ) -> anyhow::Result<crate::ResultV1> {
@@ -354,7 +377,7 @@ async fn inspect_banner(
     };
     for _ in 0..scan.banner_attempts {
         budget.consume(SYN_WIRE_BYTES).await;
-        let mut stream = match connect_banner(ip, source_ip, scan).await? {
+        let mut stream = match connect_banner(ip, source_ip, scan, service).await? {
             Ok(stream) => stream,
             Err(status) => {
                 observation.status = status;
@@ -362,9 +385,9 @@ async fn inspect_banner(
             }
         };
         observation.raw.clear();
-        observation.status = read_banner(&mut stream, scan, &mut observation.raw).await;
+        observation.status = read_banner(&mut stream, scan, service, &mut observation.raw).await;
         if observation.status == crate::BannerStatus::Ok {
-            match crate::protocol::parse(scan.protocol, &observation.raw) {
+            match crate::protocol::parse(service.protocol, &observation.raw) {
                 Ok(parsed) => observation.parsed = Some(parsed),
                 Err(status) => observation.status = status,
             }
@@ -374,19 +397,20 @@ async fn inspect_banner(
             break;
         }
     }
-    Ok(make_result(scan_id, ip, scan, syn, observation))
+    Ok(make_result(scan_id, ip, service, syn, observation))
 }
 
 async fn connect_banner(
     ip: Ipv4Addr,
     source_ip: Ipv4Addr,
     scan: &crate::config::ScanConfig,
+    service: crate::config::ServiceConfig,
 ) -> anyhow::Result<Result<tokio::net::TcpStream, crate::BannerStatus>> {
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.bind(SocketAddrV4::new(source_ip, 0).into())?;
     let connected = tokio::time::timeout(
         Duration::from_millis(scan.connect_timeout_ms),
-        socket.connect(SocketAddrV4::new(ip, scan.port).into()),
+        socket.connect(SocketAddrV4::new(ip, service.port).into()),
     )
     .await;
     Ok(match connected {
@@ -399,11 +423,12 @@ async fn connect_banner(
 async fn read_banner(
     stream: &mut tokio::net::TcpStream,
     scan: &crate::config::ScanConfig,
+    service: crate::config::ServiceConfig,
     evidence: &mut Vec<u8>,
 ) -> crate::BannerStatus {
     use tokio::io::AsyncReadExt;
     loop {
-        if let Some(status) = banner_completion(scan, evidence) {
+        if let Some(status) = banner_completion(scan, service, evidence) {
             return status;
         }
         let mut chunk = [0u8; 1024];
@@ -423,9 +448,10 @@ async fn read_banner(
 
 fn banner_completion(
     scan: &crate::config::ScanConfig,
+    service: crate::config::ServiceConfig,
     evidence: &mut Vec<u8>,
 ) -> Option<crate::BannerStatus> {
-    match crate::protocol::message_len(scan.protocol, evidence, scan.banner_max_bytes) {
+    match crate::protocol::message_len(service.protocol, evidence, scan.banner_max_bytes) {
         Ok(Some(length)) => {
             evidence.truncate(length);
             Some(crate::BannerStatus::Ok)
@@ -445,7 +471,7 @@ fn terminal_banner_status(status: crate::BannerStatus) -> bool {
 fn make_result(
     scan_id: &str,
     ip: Ipv4Addr,
-    scan: &crate::config::ScanConfig,
+    service: crate::config::ServiceConfig,
     syn: SynObservation,
     observation: BannerObservation,
 ) -> crate::ResultV1 {
@@ -457,11 +483,11 @@ fn make_result(
     let parsed = observation.parsed.unwrap_or_default();
     crate::ResultV1 {
         schema_version: crate::SCHEMA_VERSION,
-        result_id: crate::result::result_id(scan_id, ip, scan.port),
+        result_id: crate::result::result_id(scan_id, ip, service.port),
         scan_id: scan_id.into(),
         ip,
-        port: scan.port,
-        protocol: scan.protocol,
+        port: service.port,
+        protocol: service.protocol,
         state: crate::TargetState::Open,
         syn_attempts: syn.attempts,
         rtt_ms: syn.rtt_ms,
@@ -475,6 +501,9 @@ fn make_result(
         ssh: parsed.ssh,
         ftp: parsed.ftp,
         mysql: parsed.mysql,
+        smtp: parsed.smtp,
+        redis: parsed.redis,
+        postgres: parsed.postgres,
     }
 }
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -527,7 +556,7 @@ mod linux {
         thread,
         time::Instant,
     };
-    fn find_index(targets: &[u8], ip: Ipv4Addr) -> Option<usize> {
+    fn find_index(targets: &[u8], ports: &[u8], ip: Ipv4Addr, port: u16) -> Option<usize> {
         let needle = u32::from(ip);
         let n = targets.len() / 4;
         let mut lo = 0;
@@ -537,7 +566,14 @@ mod linux {
             let v = u32::from_be_bytes(targets[m * 4..m * 4 + 4].try_into().unwrap());
             if v < needle { lo = m + 1 } else { hi = m }
         }
-        (lo < n && targets[lo * 4..lo * 4 + 4] == needle.to_be_bytes()).then_some(lo)
+        while lo < n && targets[lo * 4..lo * 4 + 4] == needle.to_be_bytes() {
+            let offset = lo * 2;
+            if u16::from_be_bytes(ports[offset..offset + 2].try_into().unwrap()) == port {
+                return Some(lo);
+            }
+            lo += 1;
+        }
+        None
     }
     struct ReplyContext<'a> {
         states: &'a mut [u8],
@@ -545,11 +581,13 @@ mod linux {
         conflicts: &'a mut [u8],
         sent_times: &'a [u8],
         targets: &'a [u8],
+        ports: &'a [u8],
+        protocols: &'a [u8],
         banner_states: Option<&'a mut [u8]>,
         banner_sender: Option<&'a SyncSender<Option<OpenTarget>>>,
         secret: &'a [u8; 32],
         src: Ipv4Addr,
-        scan: &'a crate::config::ScanConfig,
+        source_port: u16,
         syn_attempts: u8,
         now_ms: u32,
     }
@@ -609,16 +647,13 @@ mod linux {
             context.secret,
             context.src,
             remote,
-            context.scan.source_port,
-            context.scan.port,
+            context.source_port,
+            source_port,
         );
-        if source_port != context.scan.port
-            || dest_port != context.scan.source_port
-            || !packet::valid_ack(cookie, ack)
-        {
+        if dest_port != context.source_port || !packet::valid_ack(cookie, ack) {
             return;
         }
-        let Some(index) = find_index(context.targets, remote) else {
+        let Some(index) = find_index(context.targets, context.ports, remote, source_port) else {
             return;
         };
         let flags = data[tcp + 13];
@@ -642,7 +677,12 @@ mod linux {
         if !valid_inner_reply(&reply, context) {
             return;
         }
-        if let Some(index) = find_index(context.targets, reply.remote) {
+        if let Some(index) = find_index(
+            context.targets,
+            context.ports,
+            reply.remote,
+            reply.dest_port,
+        ) {
             observe_response(context, index, crate::TargetState::Unreachable);
         }
     }
@@ -685,6 +725,7 @@ mod linux {
         let target = OpenTarget {
             index,
             ip: target_ip(context.targets, index),
+            service: target_service(context.ports, context.protocols, index),
             observation: SynObservation {
                 attempts: context.syn_attempts,
                 rtt_ms: decode_rtt_ms(context.rtts, index),
@@ -761,8 +802,7 @@ mod linux {
             reply.dest_port,
         );
         reply.source_ip == context.src
-            && reply.source_port == context.scan.source_port
-            && reply.dest_port == context.scan.port
+            && reply.source_port == context.source_port
             && reply.sequence == cookie
     }
 
@@ -805,6 +845,8 @@ mod linux {
 
     struct ScanBuffers<'a> {
         targets: &'a [u8],
+        ports: &'a [u8],
+        protocols: &'a [u8],
         states: &'a mut [u8],
         rtts: &'a mut [u8],
         sent_times: &'a mut [u8],
@@ -815,6 +857,8 @@ mod linux {
 
     struct ScanMaps {
         targets: Mmap,
+        ports: Mmap,
+        protocols: Mmap,
         states: memmap2::MmapMut,
         rtts: memmap2::MmapMut,
         sent_times: memmap2::MmapMut,
@@ -824,6 +868,7 @@ mod linux {
 
     struct PreparedSyn {
         ip: Ipv4Addr,
+        port: u16,
         packet: Vec<u8>,
     }
 
@@ -850,7 +895,7 @@ mod linux {
         let stopping = Arc::new(AtomicBool::new(false));
         install_stop_handler(&stopping)?;
         let timed_out = Arc::new(AtomicBool::new(false));
-        if let Some(max_runtime_secs) = cfg.scan.max_runtime_secs {
+        if let Some(max_runtime_secs) = effective_runtime_limit_secs(cfg) {
             let stopping = stopping.clone();
             let timed_out = timed_out.clone();
             thread::spawn(move || {
@@ -984,6 +1029,7 @@ mod linux {
             buffers.banner_sender.send(Some(OpenTarget {
                 index,
                 ip: target_ip(buffers.targets, index),
+                service: target_service(buffers.ports, buffers.protocols, index),
                 observation: SynObservation {
                     attempts,
                     rtt_ms: decode_rtt_ms(buffers.rtts, index),
@@ -995,9 +1041,14 @@ mod linux {
     }
 
     pub fn run(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> {
+        job.ensure_endpoint_files(cfg)?;
         let mut runtime = scan_runtime(job, cfg)?;
         let target_file = File::open(job.dir.join("targets.bin"))?;
+        let port_file = File::open(job.dir.join("ports.bin"))?;
+        let protocol_file = File::open(job.dir.join("protocols.bin"))?;
         let targets = unsafe { Mmap::map(&target_file)? };
+        let ports = unsafe { Mmap::map(&port_file)? };
+        let protocols = unsafe { Mmap::map(&protocol_file)? };
         let mut states = job.states()?;
         let mut rtts = job.rtts()?;
         let mut sent_times = job.sent_times()?;
@@ -1007,6 +1058,8 @@ mod linux {
         {
             let mut buffers = ScanBuffers {
                 targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
                 states: &mut states,
                 rtts: &mut rtts,
                 sent_times: &mut sent_times,
@@ -1024,6 +1077,8 @@ mod linux {
             banner_runner,
             ScanMaps {
                 targets,
+                ports,
+                protocols,
                 states,
                 rtts,
                 sent_times,
@@ -1055,7 +1110,7 @@ mod linux {
                 }
                 let batch = prepare_syn_batch(&mut order, cfg, runtime, buffers);
                 if !batch.is_empty() {
-                    let sent = send_syn_batch(&runtime.raw, cfg.scan.port, &batch)?;
+                    let sent = send_syn_batch(&runtime.raw, &batch)?;
                     job.meta.packets_sent = job.meta.packets_sent.saturating_add(sent as u64);
                 }
                 receive_replies(cfg, runtime, buffers, round + 1);
@@ -1088,6 +1143,7 @@ mod linux {
                 continue;
             }
             let ip = target_ip(buffers.targets, idx);
+            let service = target_service(buffers.ports, buffers.protocols, idx);
             let wait = runtime.bucket.consume_at(
                 packet::SYN_WIRE_BYTES,
                 runtime.start.elapsed().as_secs_f64(),
@@ -1101,15 +1157,16 @@ mod linux {
                 runtime.source_ip,
                 ip,
                 cfg.scan.source_port,
-                cfg.scan.port,
+                service.port,
             );
             batch.push(PreparedSyn {
                 ip,
+                port: service.port,
                 packet: packet::SynPacket {
                     src: runtime.source_ip,
                     dst: ip,
                     source_port: cfg.scan.source_port,
-                    dest_port: cfg.scan.port,
+                    dest_port: service.port,
                     seq,
                     mss: runtime.mss,
                 }
@@ -1119,18 +1176,18 @@ mod linux {
         batch
     }
 
-    fn send_syn_batch(raw: &Socket, port: u16, batch: &[PreparedSyn]) -> anyhow::Result<usize> {
+    fn send_syn_batch(raw: &Socket, batch: &[PreparedSyn]) -> anyhow::Result<usize> {
         let mut sent = 0;
         while sent < batch.len() {
-            sent += sendmmsg_once(raw, port, &batch[sent..])?;
+            sent += sendmmsg_once(raw, &batch[sent..])?;
         }
         Ok(sent)
     }
 
-    fn sendmmsg_once(raw: &Socket, port: u16, batch: &[PreparedSyn]) -> anyhow::Result<usize> {
+    fn sendmmsg_once(raw: &Socket, batch: &[PreparedSyn]) -> anyhow::Result<usize> {
         let mut addrs = batch
             .iter()
-            .map(|syn| sockaddr_in(syn.ip, port))
+            .map(|syn| sockaddr_in(syn.ip, syn.port))
             .collect::<Vec<_>>();
         let mut iovecs = batch
             .iter()
@@ -1206,11 +1263,13 @@ mod linux {
             conflicts: buffers.conflicts,
             sent_times: buffers.sent_times,
             targets: buffers.targets,
+            ports: buffers.ports,
+            protocols: buffers.protocols,
             banner_states: Some(buffers.banner_states),
             banner_sender: Some(buffers.banner_sender),
             secret: &runtime.seed,
             src: runtime.source_ip,
-            scan: &cfg.scan,
+            source_port: cfg.scan.source_port,
             syn_attempts,
             now_ms: elapsed_ms(runtime.start),
         };
@@ -1228,6 +1287,8 @@ mod linux {
         {
             let mut buffers = ScanBuffers {
                 targets: &maps.targets,
+                ports: &maps.ports,
+                protocols: &maps.protocols,
                 states: &mut maps.states,
                 rtts: &mut maps.rtts,
                 sent_times: &mut maps.sent_times,
@@ -1342,6 +1403,26 @@ mod linux {
         ))
     }
 
+    fn target_port(ports: &[u8], index: usize) -> u16 {
+        let offset = index * 2;
+        u16::from_be_bytes(ports[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn target_protocol(protocols: &[u8], index: usize) -> crate::Protocol {
+        crate::job::protocol_from_code(protocols[index]).unwrap_or(crate::Protocol::Ssh)
+    }
+
+    fn target_service(
+        ports: &[u8],
+        protocols: &[u8],
+        index: usize,
+    ) -> crate::config::ServiceConfig {
+        crate::config::ServiceConfig {
+            port: target_port(ports, index),
+            protocol: target_protocol(protocols, index),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1351,6 +1432,7 @@ mod linux {
             ScanConfig {
                 port: 22,
                 protocol: Protocol::Ssh,
+                services: vec![],
                 syn_attempts: 1,
                 source_port: 61_000,
                 connect_timeout_ms: 3_000,
@@ -1556,17 +1638,21 @@ mod linux {
             let mut sent_times = [0; 4];
             write_u32(&mut sent_times, 0, 90);
             let targets = remote.octets();
+            let ports = scan.port.to_be_bytes();
+            let protocols = [crate::job::protocol_code(scan.protocol)];
             let mut context = ReplyContext {
                 states: &mut states,
                 rtts: &mut rtts,
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
                 banner_states: None,
                 banner_sender: None,
                 secret: &secret,
                 src,
-                scan: &scan,
+                source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
             };
@@ -1593,17 +1679,21 @@ mod linux {
             let mut sent_times = [0; 4];
             write_u32(&mut sent_times, 0, 80);
             let targets = remote.octets();
+            let ports = scan.port.to_be_bytes();
+            let protocols = [crate::job::protocol_code(scan.protocol)];
             let mut context = ReplyContext {
                 states: &mut states,
                 rtts: &mut rtts,
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
                 banner_states: None,
                 banner_sender: None,
                 secret: &secret,
                 src,
-                scan: &scan,
+                source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
             };
@@ -1630,17 +1720,21 @@ mod linux {
             let mut sent_times = [0; 4];
             write_u32(&mut sent_times, 0, 75);
             let targets = remote.octets();
+            let ports = scan.port.to_be_bytes();
+            let protocols = [crate::job::protocol_code(scan.protocol)];
             let mut context = ReplyContext {
                 states: &mut states,
                 rtts: &mut rtts,
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
                 banner_states: None,
                 banner_sender: None,
                 secret: &secret,
                 src,
-                scan: &scan,
+                source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
             };
@@ -1678,17 +1772,21 @@ mod linux {
             let mut sent_times = [0; 4];
             write_u32(&mut sent_times, 0, 90);
             let targets = remote.octets();
+            let ports = scan.port.to_be_bytes();
+            let protocols = [crate::job::protocol_code(scan.protocol)];
             let mut context = ReplyContext {
                 states: &mut states,
                 rtts: &mut rtts,
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
                 banner_states: None,
                 banner_sender: None,
                 secret: &secret,
                 src,
-                scan: &scan,
+                source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
             };
@@ -1722,17 +1820,21 @@ mod linux {
             let mut sent_times = [0; 4];
             write_u32(&mut sent_times, 0, 50);
             let targets = remote.octets();
+            let ports = scan.port.to_be_bytes();
+            let protocols = [crate::job::protocol_code(scan.protocol)];
             let mut context = ReplyContext {
                 states: &mut states,
                 rtts: &mut rtts,
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
                 banner_states: None,
                 banner_sender: None,
                 secret: &secret,
                 src,
-                scan: &scan,
+                source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
             };
@@ -1747,6 +1849,11 @@ mod linux {
         fn resume_enqueues_open_targets_without_done_banner_state() -> anyhow::Result<()> {
             let (sender, receiver) = std::sync::mpsc::sync_channel(4);
             let targets = [10, 0, 0, 1, 10, 0, 0, 2];
+            let ports = [0, 22, 0, 22];
+            let protocols = [
+                crate::job::protocol_code(crate::Protocol::Ssh),
+                crate::job::protocol_code(crate::Protocol::Ssh),
+            ];
             let mut states = [
                 crate::result::encode_state_byte(crate::TargetState::Open, 1),
                 crate::result::encode_state_byte(crate::TargetState::Open, 2),
@@ -1759,6 +1866,8 @@ mod linux {
             let mut banner_states = [crate::job::BANNER_DONE, crate::job::BANNER_NOT_QUEUED];
             let mut buffers = ScanBuffers {
                 targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
                 states: &mut states,
                 rtts: &mut rtts,
                 sent_times: &mut sent_times,
@@ -1787,7 +1896,8 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncTokenBucket, estimate, final_checkpoint_index};
+    use super::ScanSummary;
+    use super::{AsyncTokenBucket, effective_runtime_limit_secs, estimate, final_checkpoint_index};
     use crate::config::{
         BudgetConfig, NetworkConfig, OutputConfig, Protocol, ScanConfig, SourceIp, TargetsConfig,
     };
@@ -1819,6 +1929,7 @@ mod tests {
             scan: ScanConfig {
                 port: 22,
                 protocol: Protocol::Ssh,
+                services: vec![],
                 syn_attempts: 3,
                 source_port: 61_000,
                 connect_timeout_ms: 3_000,
@@ -1833,6 +1944,7 @@ mod tests {
             budget: BudgetConfig {
                 time_budget_secs: Some(7_200),
                 expected_open_ratio: Some(0.50),
+                enforce_time_budget: false,
             },
             targets: TargetsConfig {
                 include: vec![PathBuf::from("unused")],
@@ -1872,5 +1984,88 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("banner"))
         );
+    }
+
+    #[test]
+    fn effective_runtime_limit_respects_enforced_budget() {
+        let mut cfg = crate::Config {
+            scan: ScanConfig {
+                port: 22,
+                protocol: Protocol::Ssh,
+                services: vec![],
+                syn_attempts: 3,
+                source_port: 61_000,
+                connect_timeout_ms: 3_000,
+                banner_timeout_ms: 5_000,
+                banner_max_bytes: 4_096,
+                banner_attempts: 2,
+                banner_concurrency: 512,
+                banner_connects_per_second: 200,
+                banner_queue_capacity: 1024,
+                max_runtime_secs: Some(100),
+            },
+            budget: BudgetConfig {
+                time_budget_secs: Some(30),
+                expected_open_ratio: None,
+                enforce_time_budget: false,
+            },
+            targets: TargetsConfig {
+                include: vec![PathBuf::from("unused")],
+                exclude: vec![],
+                allow_private: true,
+                max_targets: 10,
+            },
+            network: NetworkConfig {
+                interface: "lo".into(),
+                source_ip: SourceIp("127.0.0.1".into()),
+                provider_egress_mbps: 100.0,
+                application_ratio: 0.8,
+                tc_ratio: 0.85,
+                require_tc: false,
+                accounting: "estimated-wire".into(),
+            },
+            output: OutputConfig {
+                job_root: PathBuf::from("."),
+                output_all: false,
+            },
+        };
+
+        assert_eq!(effective_runtime_limit_secs(&cfg), Some(100));
+        cfg.budget.enforce_time_budget = true;
+        assert_eq!(effective_runtime_limit_secs(&cfg), Some(30));
+        cfg.scan.max_runtime_secs = None;
+        assert_eq!(effective_runtime_limit_secs(&cfg), Some(30));
+    }
+
+    #[test]
+    fn summary_schema_file_is_valid_json() -> anyhow::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/summary-v1.json"))?;
+
+        assert_eq!(schema["title"], "RiftMap ScanSummary");
+        assert_eq!(schema["properties"]["completed"]["type"], "boolean");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_summary_without_new_optional_fields_deserializes() -> anyhow::Result<()> {
+        let summary: ScanSummary = serde_json::from_value(serde_json::json!({
+            "completed": true,
+            "sent": 3,
+            "open": 1,
+            "closed": 1,
+            "unreachable": 0,
+            "no_response": 1,
+            "pcap_drops": 0,
+            "banner_queued": 1,
+            "banner_done": 1,
+            "banner_failed_or_incomplete": 0,
+            "timed_out": false
+        }))?;
+
+        assert_eq!(summary.syn_mss, None);
+        assert_eq!(summary.conflicting_observations, 0);
+        assert_eq!(summary.interface_tx_packets, None);
+        Ok(())
     }
 }

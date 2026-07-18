@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://riftmap.local/schemas/summary-v1.json",
+  "title": "RiftMap ScanSummary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "completed",
+    "sent",
+    "open",
+    "closed",
+    "unreachable",
+    "no_response",
+    "pcap_drops",
+    "banner_queued",
+    "banner_done",
+    "banner_failed_or_incomplete",
+    "timed_out"
+  ],
+  "properties": {
+    "completed": { "type": "boolean" },
+    "sent": { "type": "integer", "minimum": 0 },
+    "syn_mss": { "type": ["integer", "null"], "minimum": 0, "maximum": 65535 },
+    "open": { "type": "integer", "minimum": 0 },
+    "closed": { "type": "integer", "minimum": 0 },
+    "unreachable": { "type": "integer", "minimum": 0 },
+    "no_response": { "type": "integer", "minimum": 0 },
+    "pcap_drops": { "type": "integer", "minimum": 0 },
+    "conflicting_observations": { "type": "integer", "minimum": 0, "default": 0 },
+    "interface_tx_packets": { "type": ["integer", "null"], "minimum": 0 },
+    "interface_tx_bytes": { "type": ["integer", "null"], "minimum": 0 },
+    "banner_queued": { "type": "integer", "minimum": 0 },
+    "banner_done": { "type": "integer", "minimum": 0 },
+    "banner_failed_or_incomplete": { "type": "integer", "minimum": 0 },
+    "timed_out": { "type": "boolean" }
+  }
+}

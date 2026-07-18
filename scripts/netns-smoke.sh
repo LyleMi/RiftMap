@@ -68,6 +68,10 @@ cat >"${ROOT}/config.toml" <<EOF
 [scan]
 port = 2222
 protocol = "ssh"
+services = [
+  { port = 2222, protocol = "ssh" },
+  { port = 2223, protocol = "ssh" },
+]
 syn_attempts = 1
 source_port = 61000
 connect_timeout_ms = 1000
@@ -104,12 +108,22 @@ SCAN_OUTPUT="$("${BIN}" scan -c "${ROOT}/config.toml")"
 echo "${SCAN_OUTPUT}"
 JOB_DIR="$(printf '%s\n' "${SCAN_OUTPUT}" | awk '/^job: / {print $2}')"
 
+"${BIN}" job status --job "${JOB_DIR}"
+"${BIN}" job status --job "${JOB_DIR}" --json
+"${BIN}" resume --job "${JOB_DIR}"
+"${BIN}" report --job "${JOB_DIR}"
+"${BIN}" report --job "${JOB_DIR}" --json
+"${BIN}" validation-report -c "${ROOT}/config.toml" --job "${JOB_DIR}"
+"${BIN}" export --job "${JOB_DIR}"
 "${BIN}" export --job "${JOB_DIR}"
 
 RESULTS="${JOB_DIR}/results.ndjson"
 test -s "${RESULTS}"
 grep -q '"state":"open"' "${RESULTS}"
+grep -q '"state":"no_response"' "${RESULTS}"
 grep -q '"banner_status":"ok"' "${RESULTS}"
-grep -q 'U1NILTIuMC1SaWZ0TWFwU21va2UNCg==' "${RESULTS}"
+grep -q '"banner_text":"SSH-2.0-RiftMapSmoke"' "${RESULTS}"
 grep -q '"syn_mss":' "${JOB_DIR}/summary.json"
 grep -q '"interface_tx_packets":' "${JOB_DIR}/summary.json"
+grep -q '"completed": true' "${JOB_DIR}/summary.json"
+grep -q '"pcap_drops": 0' "${JOB_DIR}/summary.json"
