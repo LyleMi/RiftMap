@@ -64,7 +64,9 @@ Global unicast is allowed by default. RFC1918 ranges require
 documentation, benchmarking, multicast, reserved, and limited broadcast space
 is always removed before a job is created. A job stores an immutable config,
 cryptographic seed, target digest, network-order `targets.bin`, byte-per-target
-`state.bin`, and atomic `checkpoint.json`.
+`state.bin`, and atomic `checkpoint.json`. Gracefully finished or interrupted
+scans also atomically persist cumulative counts and completion status in
+`summary.json`.
 
 `events.ndjson` is at-least-once. `export` selects the latest deterministic
 `result_id`, sorts it stably, and writes `results.ndjson`; by default only

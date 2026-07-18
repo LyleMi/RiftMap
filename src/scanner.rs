@@ -307,14 +307,19 @@ fn make_result(
         mysql: parsed.mysql,
     }
 }
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ScanSummary {
+    pub completed: bool,
     pub sent: u64,
     pub open: u64,
     pub closed: u64,
     pub unreachable: u64,
     pub no_response: u64,
-    pub pcap_drops: u32,
+    pub pcap_drops: u64,
+}
+
+fn final_checkpoint_index(completed: bool, target_count: u64, next_index: u64) -> u64 {
+    if completed { target_count } else { next_index }
 }
 
 #[cfg(target_os = "linux")]
@@ -459,7 +464,6 @@ mod linux {
             cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio;
         let mut bucket = TokenBucket::new(rate, 0.1);
         let start = Instant::now();
-        let mut sent = 0;
         let stopping = Arc::new(AtomicBool::new(false));
         let signal = stopping.clone();
         ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
@@ -489,7 +493,7 @@ mod linux {
                 let seq = packet::syn_cookie(&seed, src, ip, cfg.scan.source_port, cfg.scan.port);
                 let p = packet::build_syn(src, ip, cfg.scan.source_port, cfg.scan.port, seq, 1460);
                 raw.send_to(&p, &SocketAddrV4::new(ip, cfg.scan.port).into())?;
-                sent += 1;
+                job.meta.packets_sent = job.meta.packets_sent.saturating_add(1);
                 receive(&mut cap, &mut states, &targets, &seed, src, cfg);
                 // Persist periodically; an atomic fsync per target makes large
                 // scans unusable. Ctrl+C always writes the exact next index.
@@ -508,11 +512,17 @@ mod linux {
         receive(&mut cap, &mut states, &targets, &seed, src, cfg);
         states.flush()?;
         let stats = cap.stats()?;
-        job.meta.degraded = stats.dropped > 0 || stats.if_dropped > 0;
-        job.checkpoint(job.meta.target_count)?;
+        let run_drops = u64::from(stats.dropped) + u64::from(stats.if_dropped);
+        job.meta.pcap_drops = job.meta.pcap_drops.saturating_add(run_drops);
+        job.meta.degraded |= run_drops > 0;
+        let completed = job.meta.round >= cfg.scan.syn_attempts;
+        let next_index =
+            final_checkpoint_index(completed, job.meta.target_count, job.meta.next_index);
+        job.checkpoint(next_index)?;
         let mut s = ScanSummary {
-            sent,
-            pcap_drops: stats.dropped + stats.if_dropped,
+            completed,
+            sent: job.meta.packets_sent,
+            pcap_drops: job.meta.pcap_drops,
             ..Default::default()
         };
         for &v in states.iter() {
@@ -533,6 +543,7 @@ mod linux {
             .collect();
         drop(states);
         drop(targets);
+        crate::job::save_summary(&job.dir, &s)?;
         tokio::runtime::Runtime::new()?.block_on(banner_pipeline(
             &job.dir,
             open_targets,
@@ -541,5 +552,16 @@ mod linux {
             &job.meta.scan_id,
         ))?;
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::final_checkpoint_index;
+
+    #[test]
+    fn interrupted_scan_preserves_resume_index() {
+        assert_eq!(final_checkpoint_index(false, 100, 37), 37);
+        assert_eq!(final_checkpoint_index(true, 100, 0), 100);
     }
 }

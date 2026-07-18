@@ -24,6 +24,10 @@ pub struct JobMeta {
     pub round: u8,
     pub next_index: u64,
     pub degraded: bool,
+    #[serde(default)]
+    pub packets_sent: u64,
+    #[serde(default)]
+    pub pcap_drops: u64,
 }
 pub struct PreparedJob {
     pub dir: PathBuf,
@@ -106,6 +110,8 @@ impl PreparedJob {
             round: 0,
             next_index: 0,
             degraded: false,
+            packets_sent: 0,
+            pcap_drops: 0,
         };
         save_meta(&dir, &meta)?;
         Ok(Self { dir, meta })
@@ -151,6 +157,19 @@ fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     }
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+pub fn save_summary(dir: &Path, summary: &crate::scanner::ScanSummary) -> anyhow::Result<()> {
+    atomic_write(
+        &dir.join("summary.json"),
+        &serde_json::to_vec_pretty(summary)?,
+    )
+}
+
+pub fn load_summary(dir: &Path) -> anyhow::Result<crate::scanner::ScanSummary> {
+    Ok(serde_json::from_slice(&fs::read(
+        dir.join("summary.json"),
+    )?)?)
 }
 
 pub fn append_event(dir: &Path, result: &ResultV1) -> anyhow::Result<()> {
@@ -344,6 +363,45 @@ mod tests {
 
         let error = export(&job.dir, true).unwrap_err();
         assert!(error.to_string().contains("before the scan has completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn summary_round_trips_atomically() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let summary = crate::scanner::ScanSummary {
+            completed: true,
+            sent: 7,
+            open: 1,
+            closed: 2,
+            unreachable: 1,
+            no_response: 3,
+            pcap_drops: 0,
+        };
+
+        save_summary(temp.path(), &summary)?;
+
+        assert_eq!(load_summary(temp.path())?, summary);
+        assert!(!temp.path().join("summary.tmp").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn old_checkpoint_defaults_cumulative_counters() -> anyhow::Result<()> {
+        let meta: JobMeta = serde_json::from_value(serde_json::json!({
+            "format_version": 1,
+            "scan_id": "scan",
+            "seed_hex": "00".repeat(32),
+            "target_count": 1,
+            "target_digest": "digest",
+            "shard_index": 0,
+            "shard_count": 1,
+            "next_index": 0,
+            "degraded": false
+        }))?;
+
+        assert_eq!(meta.packets_sent, 0);
+        assert_eq!(meta.pcap_drops, 0);
         Ok(())
     }
 }

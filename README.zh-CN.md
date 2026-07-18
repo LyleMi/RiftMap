@@ -45,7 +45,8 @@ riftmap export --job .riftmap/jobs/<scan-id>
 发生丢包，任务会标记为 degraded，此时不能把无响应当成可靠的阴性结论。
 
 任务目录保存不可变配置、随机 seed、目标摘要、网络序 `targets.bin`、每目标一
-字节的 `state.bin` 和原子更新的 `checkpoint.json`。事件日志采用至少一次写入；
+字节的 `state.bin` 和原子更新的 `checkpoint.json`。正常结束或中断的扫描还会将
+累计计数和完成状态原子写入 `summary.json`。事件日志采用至少一次写入；
 `export` 按确定性 `result_id` 去重并稳定输出。默认结果只包含出现过可信
 SYN-ACK 的目标。启用 `output_all=true` 后，已完成任务还会为没有事件的目标
 合成关闭、不可达和无响应结果；未完成任务会拒绝全量导出，避免把尚未发送的
