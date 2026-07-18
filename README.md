@@ -42,6 +42,7 @@ documentation-only fixture ranges with your authorized targets. Input lines
 are IPv4 addresses or CIDRs; blank lines, comments, and inline `#` comments are
 accepted. For CIDR entries, subnet-directed broadcast addresses are removed
 automatically; explicitly listed single IPs are preserved. Excludes always win.
+For a step-by-step runbook, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ```sh
 riftmap estimate -c config.local.toml
@@ -96,6 +97,14 @@ cannot be treated as reliable negatives.
 On resume, open targets whose banner state is not done are queued again, while
 done targets are skipped. Older jobs without `banner_state.bin` are backfilled
 from `events.ndjson`.
+
+More details:
+
+- [`docs/SAFETY_MODEL.md`](docs/SAFETY_MODEL.md) explains target filtering,
+  negative results, and rate-safety assumptions.
+- [`docs/RESULT_SCHEMA.md`](docs/RESULT_SCHEMA.md) documents `events.ndjson`,
+  `results.ndjson`, and `summary.json`.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) tracks known feature and validation gaps.
 
 ## Development
 
