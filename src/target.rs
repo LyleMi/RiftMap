@@ -103,54 +103,55 @@ pub fn subtract(includes: &[Ipv4Range], excludes: &[Ipv4Range]) -> Vec<Ipv4Range
 }
 
 pub fn is_allowed(ip: Ipv4Addr, allow_private: bool) -> bool {
-    let n = u32::from(ip);
-    let in_net = |base: u32, bits: u8| n & (u32::MAX << (32 - bits)) == base;
-    if n == 0
-        || n == u32::MAX
-        || in_net(0, 8)
-        || in_net(0x7f00_0000, 8)
-        || in_net(0xa9fe_0000, 16)
-        || in_net(0xe000_0000, 4)
-        || in_net(0xf000_0000, 4)
-        || in_net(0x6440_0000, 10)
-        || in_net(0xc000_0000, 24)
-        || in_net(0xc000_0200, 24)
-        || in_net(0xc612_0000, 15)
-        || in_net(0xc633_6400, 24)
-        || in_net(0xcb00_7100, 24)
-        || in_net(0xc058_6300, 24)
-    {
-        return false;
-    }
-    let private = in_net(0x0a00_0000, 8) || in_net(0xac10_0000, 12) || in_net(0xc0a8_0000, 16);
-    allow_private || !private
+    let value = u32::from(ip);
+    !denied_ranges(allow_private)
+        .iter()
+        .any(|range| range.start <= value && value <= range.end)
 }
 
 pub fn filter_allowed(ranges: &[Ipv4Range], allow_private: bool) -> Vec<Ipv4Range> {
-    let cidr = |s: &str| parse_entry(s).unwrap();
-    let mut denied = vec![
-        cidr("0.0.0.0/8"),
-        cidr("100.64.0.0/10"),
-        cidr("127.0.0.0/8"),
-        cidr("169.254.0.0/16"),
-        cidr("192.0.0.0/24"),
-        cidr("192.0.2.0/24"),
-        cidr("192.88.99.0/24"),
-        cidr("198.18.0.0/15"),
-        cidr("198.51.100.0/24"),
-        cidr("203.0.113.0/24"),
-        cidr("224.0.0.0/4"),
-        cidr("240.0.0.0/4"),
-    ];
-    if !allow_private {
-        denied.extend([
-            cidr("10.0.0.0/8"),
-            cidr("172.16.0.0/12"),
-            cidr("192.168.0.0/16"),
-        ]);
-    }
-    subtract(ranges, &merge(denied))
+    subtract(ranges, &merge(denied_ranges(allow_private)))
 }
+
+fn denied_ranges(allow_private: bool) -> Vec<Ipv4Range> {
+    let mut denied = RESERVED_CIDRS
+        .iter()
+        .map(|&(base, bits)| cidr_range(base, bits))
+        .collect::<Vec<_>>();
+    if !allow_private {
+        denied.extend(
+            PRIVATE_CIDRS
+                .iter()
+                .map(|&(base, bits)| cidr_range(base, bits)),
+        );
+    }
+    denied
+}
+
+fn cidr_range(base: u32, bits: u8) -> Ipv4Range {
+    let host_mask = u32::MAX >> bits;
+    Ipv4Range {
+        start: base,
+        end: base | host_mask,
+    }
+}
+
+const RESERVED_CIDRS: &[(u32, u8)] = &[
+    (0x0000_0000, 8),
+    (0x6440_0000, 10),
+    (0x7f00_0000, 8),
+    (0xa9fe_0000, 16),
+    (0xc000_0000, 24),
+    (0xc000_0200, 24),
+    (0xc058_6300, 24),
+    (0xc612_0000, 15),
+    (0xc633_6400, 24),
+    (0xcb00_7100, 24),
+    (0xe000_0000, 4),
+    (0xf000_0000, 4),
+];
+
+const PRIVATE_CIDRS: &[(u32, u8)] = &[(0x0a00_0000, 8), (0xac10_0000, 12), (0xc0a8_0000, 16)];
 
 pub fn count(ranges: &[Ipv4Range]) -> u64 {
     ranges.iter().map(|r| r.len()).sum()

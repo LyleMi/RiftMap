@@ -38,9 +38,8 @@ pub fn message_len(
 }
 
 fn ftp_len(data: &[u8]) -> Result<Option<usize>, BannerStatus> {
-    let first_end = match data.windows(2).position(|w| w == b"\r\n") {
-        Some(i) => i + 2,
-        None => return Ok(None),
+    let Some(first_end) = line_end(data) else {
+        return Ok(None);
     };
     if data.len() < 4 || !data[..3].iter().all(u8::is_ascii_digit) {
         return Err(BannerStatus::ProtocolMismatch);
@@ -51,19 +50,26 @@ fn ftp_len(data: &[u8]) -> Result<Option<usize>, BannerStatus> {
     if data[3] != b'-' {
         return Err(BannerStatus::ProtocolMismatch);
     }
-    let mut needle = Vec::from(&data[..3]);
-    needle.push(b' ');
-    let rest = &data[first_end..];
-    for (offset, line) in rest.split_inclusive(|&b| b == b'\n').scan(0usize, |p, l| {
-        let o = *p;
-        *p += l.len();
-        Some((o, l))
-    }) {
-        if line.starts_with(&needle) && line.ends_with(b"\r\n") {
-            return Ok(Some(first_end + offset + line.len()));
-        }
-    }
-    Ok(None)
+    Ok(multiline_ftp_end(data, first_end))
+}
+
+fn line_end(data: &[u8]) -> Option<usize> {
+    data.windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|i| i + 2)
+}
+
+fn multiline_ftp_end(data: &[u8], first_end: usize) -> Option<usize> {
+    let mut needle = [0; 4];
+    needle[..3].copy_from_slice(&data[..3]);
+    needle[3] = b' ';
+    data[first_end..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .and_then(|offset| {
+            let line_start = first_end + offset;
+            line_end(&data[line_start..]).map(|length| line_start + length)
+        })
 }
 
 pub fn parse(protocol: Protocol, data: &[u8]) -> Result<ParsedBanner, BannerStatus> {

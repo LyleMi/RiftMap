@@ -5,49 +5,49 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn d_syn_attempts() -> u8 {
+pub(crate) fn d_syn_attempts() -> u8 {
     3
 }
-fn d_source_port() -> u16 {
+pub(crate) fn d_source_port() -> u16 {
     61000
 }
-fn d_connect_timeout() -> u64 {
+pub(crate) fn d_connect_timeout() -> u64 {
     3000
 }
-fn d_banner_timeout() -> u64 {
+pub(crate) fn d_banner_timeout() -> u64 {
     5000
 }
-fn d_banner_bytes() -> usize {
+pub(crate) fn d_banner_bytes() -> usize {
     4096
 }
-fn d_banner_attempts() -> u8 {
+pub(crate) fn d_banner_attempts() -> u8 {
     2
 }
-fn d_concurrency() -> usize {
+pub(crate) fn d_concurrency() -> usize {
     512
 }
-fn d_cps() -> u32 {
+pub(crate) fn d_cps() -> u32 {
     200
 }
-fn d_max_targets() -> u64 {
+pub(crate) fn d_max_targets() -> u64 {
     25_000_000
 }
-fn d_provider() -> f64 {
+pub(crate) fn d_provider() -> f64 {
     100.0
 }
-fn d_app_ratio() -> f64 {
+pub(crate) fn d_app_ratio() -> f64 {
     0.80
 }
-fn d_tc_ratio() -> f64 {
+pub(crate) fn d_tc_ratio() -> f64 {
     0.85
 }
-fn d_require_tc() -> bool {
+pub(crate) fn d_require_tc() -> bool {
     true
 }
-fn d_accounting() -> String {
+pub(crate) fn d_accounting() -> String {
     "estimated-wire".into()
 }
-fn d_job_root() -> PathBuf {
+pub(crate) fn d_job_root() -> PathBuf {
     ".riftmap/jobs".into()
 }
 
