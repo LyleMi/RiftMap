@@ -10,8 +10,6 @@ use, the following plan items still need implementation or native-Linux proof:
   shared estimated-wire token bucket.
 - Per-response RTT, exact attempt counts, conflicting observation history,
   interface TX telemetry, and persisted summary output are incomplete.
-- `output_all=true` does not yet synthesize results for targets without an open
-  event.
 - The pcap decoder supports Ethernet and raw IPv4 framing; Linux cooked capture
   link-layer headers need explicit handling and tests.
 - Netns/veth/tc accuracy, loss curves, 20-million-target RSS, Ctrl+C recovery,

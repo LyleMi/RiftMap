@@ -174,6 +174,9 @@ pub fn export(dir: &Path, output_all: bool) -> anyhow::Result<usize> {
             by_id.insert(r.result_id.clone(), r);
         }
     }
+    if output_all {
+        synthesize_missing_results(dir, &mut by_id)?;
+    }
     let mut out = BufWriter::new(File::create(dir.join("results.ndjson"))?);
     let mut n = 0;
     for r in by_id.into_values() {
@@ -185,4 +188,162 @@ pub fn export(dir: &Path, output_all: bool) -> anyhow::Result<usize> {
     }
     out.flush()?;
     Ok(n)
+}
+
+fn synthesize_missing_results(
+    dir: &Path,
+    by_id: &mut BTreeMap<String, ResultV1>,
+) -> anyhow::Result<()> {
+    let cfg = Config::load(dir.join("config.toml")).context("load immutable job config")?;
+    let job = PreparedJob::open(dir).context("load job checkpoint")?;
+    anyhow::ensure!(
+        job.meta.round >= cfg.scan.syn_attempts,
+        "cannot export all targets before the scan has completed"
+    );
+
+    let targets_path = dir.join("targets.bin");
+    let states_path = dir.join("state.bin");
+    let target_bytes = job
+        .meta
+        .target_count
+        .checked_mul(4)
+        .context("target file length overflow")?;
+    anyhow::ensure!(
+        fs::metadata(&targets_path)?.len() == target_bytes,
+        "targets.bin length does not match checkpoint target_count"
+    );
+    anyhow::ensure!(
+        fs::metadata(&states_path)?.len() == job.meta.target_count,
+        "state.bin length does not match checkpoint target_count"
+    );
+
+    let mut targets = BufReader::new(File::open(targets_path)?);
+    let mut states = BufReader::new(File::open(states_path)?);
+    for _ in 0..job.meta.target_count {
+        let mut target = [0; 4];
+        let mut state = [0];
+        targets.read_exact(&mut target)?;
+        states.read_exact(&mut state)?;
+        let ip = Ipv4Addr::from(u32::from_be_bytes(target));
+        let id = crate::result::result_id(&job.meta.scan_id, ip, cfg.scan.port);
+        let state = match state[0] {
+            3 => TargetState::Open,
+            2 => TargetState::Closed,
+            1 => TargetState::Unreachable,
+            0 => TargetState::NoResponse,
+            value => anyhow::bail!("invalid target state byte {value}"),
+        };
+        by_id.entry(id.clone()).or_insert_with(|| ResultV1 {
+            schema_version: crate::SCHEMA_VERSION,
+            result_id: id,
+            scan_id: job.meta.scan_id.clone(),
+            ip,
+            port: cfg.scan.port,
+            protocol: cfg.scan.protocol,
+            state,
+            // A completed no-response target necessarily exhausted every
+            // round. The current state format does not preserve the exact
+            // response round for other outcomes, so keep their count unknown.
+            syn_attempts: if state == TargetState::NoResponse {
+                cfg.scan.syn_attempts
+            } else {
+                0
+            },
+            rtt_ms: None,
+            first_observed_at: None,
+            last_observed_at: None,
+            banner_status: None,
+            banner_base64: None,
+            banner_text: None,
+            ssh: None,
+            ftp: None,
+            mysql: None,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        NetworkConfig, OutputConfig, Protocol, ScanConfig, SourceIp, TargetsConfig,
+    };
+
+    fn config(root: &Path, include: PathBuf, output_all: bool) -> Config {
+        Config {
+            scan: ScanConfig {
+                port: 22,
+                protocol: Protocol::Ssh,
+                syn_attempts: 3,
+                source_port: 61_000,
+                connect_timeout_ms: 3_000,
+                banner_timeout_ms: 5_000,
+                banner_max_bytes: 4_096,
+                banner_attempts: 2,
+                banner_concurrency: 8,
+                banner_connects_per_second: 10,
+            },
+            targets: TargetsConfig {
+                include: vec![include],
+                exclude: vec![],
+                allow_private: true,
+                max_targets: 10,
+            },
+            network: NetworkConfig {
+                interface: "lo".into(),
+                source_ip: SourceIp("127.0.0.1".into()),
+                provider_egress_mbps: 100.0,
+                application_ratio: 0.8,
+                tc_ratio: 0.85,
+                require_tc: false,
+                accounting: "estimated-wire".into(),
+            },
+            output: OutputConfig {
+                job_root: root.into(),
+                output_all,
+            },
+        }
+    }
+
+    #[test]
+    fn output_all_synthesizes_targets_without_events() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let include = temp.path().join("targets.txt");
+        fs::write(&include, "10.0.0.1\n10.0.0.2\n10.0.0.3\n")?;
+        let cfg = config(temp.path(), include, true);
+        let mut job = PreparedJob::create(&cfg, Some([1; 32]))?;
+        {
+            let mut states = job.states()?;
+            states.copy_from_slice(&[0, 1, 2]);
+            states.flush()?;
+        }
+        job.meta.round = cfg.scan.syn_attempts;
+        job.checkpoint(job.meta.target_count)?;
+
+        assert_eq!(export(&job.dir, true)?, 3);
+        let results: Vec<ResultV1> = fs::read_to_string(job.dir.join("results.ndjson"))?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(results.len(), 3);
+        let states: BTreeMap<_, _> = results.into_iter().map(|r| (r.ip, r.state)).collect();
+        assert_eq!(states[&"10.0.0.1".parse()?], TargetState::NoResponse);
+        assert_eq!(states[&"10.0.0.2".parse()?], TargetState::Unreachable);
+        assert_eq!(states[&"10.0.0.3".parse()?], TargetState::Closed);
+        Ok(())
+    }
+
+    #[test]
+    fn output_all_rejects_incomplete_scan() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let include = temp.path().join("targets.txt");
+        fs::write(&include, "10.0.0.1\n")?;
+        let cfg = config(temp.path(), include, true);
+        let job = PreparedJob::create(&cfg, Some([2; 32]))?;
+
+        let error = export(&job.dir, true).unwrap_err();
+        assert!(error.to_string().contains("before the scan has completed"));
+        Ok(())
+    }
 }

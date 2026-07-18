@@ -68,9 +68,12 @@ cryptographic seed, target digest, network-order `targets.bin`, byte-per-target
 
 `events.ndjson` is at-least-once. `export` selects the latest deterministic
 `result_id`, sorts it stably, and writes `results.ndjson`; by default only
-targets with a cookie-validated SYN-ACK are emitted. A non-zero pcap drop count
-marks the job degraded, so no-response observations must not be treated as
-reliable negatives.
+targets with a cookie-validated SYN-ACK are emitted. With `output_all=true`, a
+completed job also emits synthesized closed, unreachable, and no-response
+records for targets without events; incomplete jobs are rejected to avoid
+classifying unsent targets as no-response. A non-zero pcap drop count marks the
+job degraded, so no-response observations must not be treated as reliable
+negatives.
 
 ## Development
 

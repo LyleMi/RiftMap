@@ -47,7 +47,9 @@ riftmap export --job .riftmap/jobs/<scan-id>
 任务目录保存不可变配置、随机 seed、目标摘要、网络序 `targets.bin`、每目标一
 字节的 `state.bin` 和原子更新的 `checkpoint.json`。事件日志采用至少一次写入；
 `export` 按确定性 `result_id` 去重并稳定输出。默认结果只包含出现过可信
-SYN-ACK 的目标。
+SYN-ACK 的目标。启用 `output_all=true` 后，已完成任务还会为没有事件的目标
+合成关闭、不可达和无响应结果；未完成任务会拒绝全量导出，避免把尚未发送的
+目标误判为无响应。
 
 Rust MSRV 为 1.85，仅在 CI 固定版本，不强制覆盖本机工具链。运行目标为
 x86_64 Linux，同时进行 aarch64 Linux 编译验证。许可证为
