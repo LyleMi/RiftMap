@@ -31,7 +31,13 @@ pub struct PreparedJob {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut output, b| {
+            write!(&mut output, "{b:02x}").expect("writing to a String cannot fail");
+            output
+        })
 }
 pub fn decode_seed(s: &str) -> anyhow::Result<[u8; 32]> {
     anyhow::ensure!(s.len() == 64, "invalid seed");

@@ -24,7 +24,7 @@ pub fn message_len(
             if data.len() < 4 {
                 return Ok(None);
             }
-            let n = data[0] as usize | (data[1] as usize) << 8 | (data[2] as usize) << 16;
+            let n = data[0] as usize | ((data[1] as usize) << 8) | ((data[2] as usize) << 16);
             let total = n.checked_add(4).ok_or(BannerStatus::Oversized)?;
             if total > max {
                 Err(BannerStatus::Oversized)
