@@ -14,8 +14,6 @@ use, the following plan items still need implementation or native-Linux proof:
   shared estimated-wire token bucket.
 - Per-response RTT, exact attempt counts, conflicting observation history, and
   interface TX telemetry are incomplete.
-- The pcap decoder supports Ethernet and raw IPv4 framing; Linux cooked capture
-  link-layer headers need explicit handling and tests.
 - Netns/veth/tc accuracy, loss curves, 20-million-target RSS, and aarch64
   compilation still require CI or broader native-Linux validation.
 

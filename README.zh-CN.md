@@ -50,7 +50,8 @@ riftmap export --job .riftmap/jobs/<scan-id>
 `export` 按确定性 `result_id` 去重并稳定输出。默认结果只包含出现过可信
 SYN-ACK 的目标。启用 `output_all=true` 后，已完成任务还会为没有事件的目标
 合成关闭、不可达和无响应结果；未完成任务会拒绝全量导出，避免把尚未发送的
-目标误判为无响应。
+目标误判为无响应。pcap 丢包导致的 degraded 任务也会拒绝 `output_all=true`，
+因为此时不能把无响应当成可靠的阴性结论。
 
 Rust MSRV 为 1.85，仅在 CI 固定版本，不强制覆盖本机工具链。运行目标为
 x86_64 Linux，同时进行 aarch64 Linux 编译验证。许可证为

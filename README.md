@@ -73,9 +73,9 @@ scans also atomically persist cumulative counts and completion status in
 targets with a cookie-validated SYN-ACK are emitted. With `output_all=true`, a
 completed job also emits synthesized closed, unreachable, and no-response
 records for targets without events; incomplete jobs are rejected to avoid
-classifying unsent targets as no-response. A non-zero pcap drop count marks the
-job degraded, so no-response observations must not be treated as reliable
-negatives.
+classifying unsent targets as no-response. Degraded jobs with non-zero pcap
+drops are also rejected for `output_all=true`, because no-response observations
+cannot be treated as reliable negatives.
 
 ## Development
 

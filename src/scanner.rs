@@ -386,8 +386,20 @@ mod linux {
     }
 
     fn ipv4_header(data: &[u8]) -> Option<(usize, usize, u8)> {
-        let offset = usize::from(data.first().map(|byte| byte >> 4) != Some(4)) * 14;
-        if data.len() < offset + 40 || data[offset] >> 4 != 4 {
+        if data.first().map(|byte| byte >> 4) == Some(4) {
+            return parse_ipv4_header(data, 0);
+        }
+        if data.len() >= 14 && data[12..14] == [0x08, 0x00] {
+            return parse_ipv4_header(data, 14);
+        }
+        if data.len() >= 16 && data[14..16] == [0x08, 0x00] {
+            return parse_ipv4_header(data, 16);
+        }
+        None
+    }
+
+    fn parse_ipv4_header(data: &[u8], offset: usize) -> Option<(usize, usize, u8)> {
+        if data.len() < offset + 20 || data[offset] >> 4 != 4 {
             return None;
         }
         let ihl = ((data[offset] & 15) as usize) * 4;
@@ -734,6 +746,224 @@ mod linux {
         Ipv4Addr::from(u32::from_be_bytes(
             targets[index * 4..index * 4 + 4].try_into().unwrap(),
         ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::config::{Protocol, ScanConfig};
+
+        fn scan_config() -> ScanConfig {
+            ScanConfig {
+                port: 22,
+                protocol: Protocol::Ssh,
+                syn_attempts: 1,
+                source_port: 61_000,
+                connect_timeout_ms: 3_000,
+                banner_timeout_ms: 5_000,
+                banner_max_bytes: 4_096,
+                banner_attempts: 1,
+                banner_concurrency: 1,
+                banner_connects_per_second: 1,
+            }
+        }
+
+        fn ipv4_packet(protocol: u8, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+            let total = 20 + payload.len();
+            let mut packet = vec![0; total];
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            packet[8] = 64;
+            packet[9] = protocol;
+            packet[12..16].copy_from_slice(&src.octets());
+            packet[16..20].copy_from_slice(&dst.octets());
+            packet[20..].copy_from_slice(payload);
+            packet
+        }
+
+        fn tcp_segment(source_port: u16, dest_port: u16, seq: u32, ack: u32, flags: u8) -> Vec<u8> {
+            let mut tcp = vec![0; 20];
+            tcp[0..2].copy_from_slice(&source_port.to_be_bytes());
+            tcp[2..4].copy_from_slice(&dest_port.to_be_bytes());
+            tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+            tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+            tcp[12] = 5 << 4;
+            tcp[13] = flags;
+            tcp
+        }
+
+        fn ethernet_ipv4(mut packet: Vec<u8>) -> Vec<u8> {
+            let mut frame = vec![0; 14];
+            frame[12..14].copy_from_slice(&[0x08, 0x00]);
+            frame.append(&mut packet);
+            frame
+        }
+
+        fn sll_ipv4(mut packet: Vec<u8>) -> Vec<u8> {
+            let mut frame = vec![0; 16];
+            frame[14..16].copy_from_slice(&[0x08, 0x00]);
+            frame.append(&mut packet);
+            frame
+        }
+
+        #[test]
+        fn ipv4_header_accepts_raw_ipv4() {
+            let packet = ipv4_packet(6, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, &[0; 20]);
+
+            assert_eq!(ipv4_header(&packet), Some((0, 20, 6)));
+        }
+
+        #[test]
+        fn ipv4_header_accepts_ethernet_ipv4() {
+            let packet = ethernet_ipv4(ipv4_packet(
+                6,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::UNSPECIFIED,
+                &[0; 20],
+            ));
+
+            assert_eq!(ipv4_header(&packet), Some((14, 20, 6)));
+        }
+
+        #[test]
+        fn ipv4_header_accepts_linux_cooked_capture_ipv4() {
+            let packet = sll_ipv4(ipv4_packet(
+                6,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::UNSPECIFIED,
+                &[0; 20],
+            ));
+
+            assert_eq!(ipv4_header(&packet), Some((16, 20, 6)));
+        }
+
+        #[test]
+        fn ipv4_header_rejects_linux_cooked_capture_non_ipv4() {
+            let mut packet = vec![0; 16 + 20];
+            packet[14..16].copy_from_slice(&[0x86, 0xdd]);
+            packet[16] = 0x45;
+
+            assert_eq!(ipv4_header(&packet), None);
+        }
+
+        #[test]
+        fn ipv4_header_rejects_truncated_frames() {
+            assert_eq!(ipv4_header(&[0x45; 19]), None);
+
+            let mut ethernet = vec![0; 14 + 19];
+            ethernet[12..14].copy_from_slice(&[0x08, 0x00]);
+            ethernet[14] = 0x45;
+            assert_eq!(ipv4_header(&ethernet), None);
+
+            let mut sll = vec![0; 16 + 19];
+            sll[14..16].copy_from_slice(&[0x08, 0x00]);
+            sll[16] = 0x45;
+            assert_eq!(ipv4_header(&sll), None);
+        }
+
+        #[test]
+        fn ethernet_syn_ack_marks_target_open() {
+            let src = Ipv4Addr::new(192, 0, 2, 10);
+            let remote = Ipv4Addr::new(198, 51, 100, 20);
+            let secret = [7; 32];
+            let scan = scan_config();
+            let cookie = packet::syn_cookie(&secret, src, remote, scan.source_port, scan.port);
+            let tcp = tcp_segment(scan.port, scan.source_port, 0, cookie.wrapping_add(1), 0x12);
+            let packet = ethernet_ipv4(ipv4_packet(6, remote, src, &tcp));
+            let (offset, ihl, _) = ipv4_header(&packet).unwrap();
+            let mut states = [0];
+            let targets = remote.octets();
+            let mut context = ReplyContext {
+                states: &mut states,
+                targets: &targets,
+                secret: &secret,
+                src,
+                scan: &scan,
+            };
+
+            handle_tcp_reply(&packet, offset, ihl, &mut context);
+
+            assert_eq!(states[0], 3);
+        }
+
+        #[test]
+        fn linux_cooked_capture_syn_ack_marks_target_open() {
+            let src = Ipv4Addr::new(192, 0, 2, 10);
+            let remote = Ipv4Addr::new(198, 51, 100, 20);
+            let secret = [7; 32];
+            let scan = scan_config();
+            let cookie = packet::syn_cookie(&secret, src, remote, scan.source_port, scan.port);
+            let tcp = tcp_segment(scan.port, scan.source_port, 0, cookie.wrapping_add(1), 0x12);
+            let packet = sll_ipv4(ipv4_packet(6, remote, src, &tcp));
+            let (offset, ihl, _) = ipv4_header(&packet).unwrap();
+            let mut states = [0];
+            let targets = remote.octets();
+            let mut context = ReplyContext {
+                states: &mut states,
+                targets: &targets,
+                secret: &secret,
+                src,
+                scan: &scan,
+            };
+
+            handle_tcp_reply(&packet, offset, ihl, &mut context);
+
+            assert_eq!(states[0], 3);
+        }
+
+        #[test]
+        fn linux_cooked_capture_rst_marks_target_closed() {
+            let src = Ipv4Addr::new(192, 0, 2, 10);
+            let remote = Ipv4Addr::new(198, 51, 100, 20);
+            let secret = [7; 32];
+            let scan = scan_config();
+            let cookie = packet::syn_cookie(&secret, src, remote, scan.source_port, scan.port);
+            let tcp = tcp_segment(scan.port, scan.source_port, 0, cookie.wrapping_add(1), 0x04);
+            let packet = sll_ipv4(ipv4_packet(6, remote, src, &tcp));
+            let (offset, ihl, _) = ipv4_header(&packet).unwrap();
+            let mut states = [0];
+            let targets = remote.octets();
+            let mut context = ReplyContext {
+                states: &mut states,
+                targets: &targets,
+                secret: &secret,
+                src,
+                scan: &scan,
+            };
+
+            handle_tcp_reply(&packet, offset, ihl, &mut context);
+
+            assert_eq!(states[0], 2);
+        }
+
+        #[test]
+        fn linux_cooked_capture_icmp_unreachable_marks_target_unreachable() {
+            let src = Ipv4Addr::new(192, 0, 2, 10);
+            let remote = Ipv4Addr::new(198, 51, 100, 20);
+            let router = Ipv4Addr::new(203, 0, 113, 1);
+            let secret = [7; 32];
+            let scan = scan_config();
+            let cookie = packet::syn_cookie(&secret, src, remote, scan.source_port, scan.port);
+            let inner_tcp = tcp_segment(scan.source_port, scan.port, cookie, 0, 0x02);
+            let inner_ip = ipv4_packet(6, src, remote, &inner_tcp);
+            let mut icmp = vec![3, 1, 0, 0, 0, 0, 0, 0];
+            icmp.extend_from_slice(&inner_ip[..28]);
+            let packet = sll_ipv4(ipv4_packet(1, router, src, &icmp));
+            let (offset, ihl, _) = ipv4_header(&packet).unwrap();
+            let mut states = [0];
+            let targets = remote.octets();
+            let mut context = ReplyContext {
+                states: &mut states,
+                targets: &targets,
+                secret: &secret,
+                src,
+                scan: &scan,
+            };
+
+            handle_icmp_reply(&packet, offset, ihl, &mut context);
+
+            assert_eq!(states[0], 1);
+        }
     }
 }
 

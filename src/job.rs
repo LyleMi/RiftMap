@@ -219,6 +219,10 @@ fn synthesize_missing_results(
         job.meta.round >= cfg.scan.syn_attempts,
         "cannot export all targets before the scan has completed"
     );
+    anyhow::ensure!(
+        !job.meta.degraded && job.meta.pcap_drops == 0,
+        "cannot export all targets from a degraded scan with pcap drops"
+    );
 
     let targets_path = dir.join("targets.bin");
     let states_path = dir.join("state.bin");
@@ -363,6 +367,23 @@ mod tests {
 
         let error = export(&job.dir, true).unwrap_err();
         assert!(error.to_string().contains("before the scan has completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn output_all_rejects_degraded_scan() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let include = temp.path().join("targets.txt");
+        fs::write(&include, "10.0.0.1\n")?;
+        let cfg = config(temp.path(), include, true);
+        let mut job = PreparedJob::create(&cfg, Some([3; 32]))?;
+        job.meta.round = cfg.scan.syn_attempts;
+        job.meta.degraded = true;
+        job.meta.pcap_drops = 1;
+        job.checkpoint(job.meta.target_count)?;
+
+        let error = export(&job.dir, true).unwrap_err();
+        assert!(error.to_string().contains("degraded scan"));
         Ok(())
     }
 
