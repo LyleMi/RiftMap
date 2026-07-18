@@ -27,3 +27,11 @@ jobs:
       - env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo check --target aarch64-unknown-linux-gnu
+  native-netns-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y libpcap-dev iproute2 python3
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo build
+      - run: sudo -E bash scripts/netns-smoke.sh target/debug/riftmap

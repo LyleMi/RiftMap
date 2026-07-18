@@ -18,18 +18,20 @@ impl TokenBucket {
         }
     }
     pub fn consume_at(&mut self, bytes: u64, now_seconds: f64) -> Duration {
-        let elapsed = (now_seconds - self.last_seconds).max(0.0);
+        let requested_seconds = now_seconds;
+        let accounted_seconds = requested_seconds.max(self.last_seconds);
+        let elapsed = accounted_seconds - self.last_seconds;
         self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
-        self.last_seconds = now_seconds;
         let need = bytes as f64;
         if self.tokens >= need {
             self.tokens -= need;
-            Duration::ZERO
+            self.last_seconds = accounted_seconds;
+            Duration::from_secs_f64(accounted_seconds - requested_seconds)
         } else {
             let d = (need - self.tokens) / self.rate;
             self.tokens = 0.0;
-            self.last_seconds += d;
-            Duration::from_secs_f64(d)
+            self.last_seconds = accounted_seconds + d;
+            Duration::from_secs_f64(self.last_seconds - requested_seconds)
         }
     }
 }
@@ -42,5 +44,14 @@ mod tests {
         assert_eq!(b.consume_at(100, 0.0), Duration::ZERO);
         assert_eq!(b.consume_at(50, 0.0), Duration::from_millis(500));
         assert_eq!(b.consume_at(50, 1.0), Duration::ZERO);
+    }
+
+    #[test]
+    fn future_reservations_accumulate() {
+        let mut b = TokenBucket::new(100.0, 1.0);
+
+        assert_eq!(b.consume_at(100, 0.0), Duration::ZERO);
+        assert_eq!(b.consume_at(50, 0.0), Duration::from_millis(500));
+        assert_eq!(b.consume_at(50, 0.0), Duration::from_secs(1));
     }
 }

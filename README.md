@@ -12,9 +12,10 @@ sends client protocol data.
 ## Status and scope
 
 This repository is an experimental MVP, not a production-ready scanner. The
-portable core is covered by unit tests, but the Linux raw-socket backend still
-requires native-Linux integration and accuracy validation before operational
-use. See [`KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md).
+portable core is covered by unit tests, and CI includes a namespace-isolated
+Linux smoke test, but broader native-Linux accuracy and scale validation is
+still required before operational use. See
+[`KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md).
 
 The MVP supports one IPv4 TCP port and protocol per job, deterministic target
 ordering, up to three no-response rounds, mmap state, atomic checkpoints,
@@ -39,7 +40,8 @@ override. x86_64 Linux is the runtime target; aarch64 Linux is a compile target.
 Copy `config.example.toml` to the ignored `config.local.toml`, then replace the
 documentation-only fixture ranges with your authorized targets. Input lines
 are IPv4 addresses or CIDRs; blank lines, comments, and inline `#` comments are
-accepted. Excludes always win.
+accepted. For CIDR entries, subnet-directed broadcast addresses are removed
+automatically; explicitly listed single IPs are preserved. Excludes always win.
 
 ```sh
 riftmap estimate -c config.local.toml
@@ -55,7 +57,10 @@ riftmap export --job .riftmap/jobs/<scan-id>
 RiftMap never changes qdisc. With `require_tc=true`, it refuses a live scan
 unless the root qdisc is TBF. The application budget defaults to 80% of the
 provider rate and the suggested TBF ceiling to 85%. Estimated SYN wire cost is
-the IPv4 packet plus 38 bytes for link framing, FCS, preamble, and IFG.
+the IPv4 packet plus 38 bytes for link framing, FCS, preamble, and IFG. Raw
+SYN discovery and banner TCP connect attempts share the same application
+token bucket; banner collection also keeps its configured CPS and concurrency
+limits.
 
 ## Target safety
 
@@ -66,7 +71,12 @@ is always removed before a job is created. A job stores an immutable config,
 cryptographic seed, target digest, network-order `targets.bin`, byte-per-target
 `state.bin`, and atomic `checkpoint.json`. Gracefully finished or interrupted
 scans also atomically persist cumulative counts and completion status in
-`summary.json`.
+`summary.json`. Cookie-validated SYN-ACK, RST, and ICMP responses persist the
+observed SYN attempt, RTT, and conflicting observation counts for export. On
+Linux, `summary.json` also records interface TX packet and byte deltas observed
+across raw discovery and banner collection. Raw SYN packets advertise an MSS
+derived from the bound interface MTU and are transmitted with `sendmmsg`
+batches.
 
 `events.ndjson` is at-least-once. `export` selects the latest deterministic
 `result_id`, sorts it stably, and writes `results.ndjson`; by default only
@@ -83,6 +93,7 @@ cannot be treated as reliable negatives.
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+sudo -E bash scripts/netns-smoke.sh target/debug/riftmap
 ```
 
 Integration tests must use network namespaces or reserved local lab ranges;

@@ -147,10 +147,11 @@ pub fn scan(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> 
 
 async fn banner_pipeline(
     job_dir: &Path,
-    targets: Vec<Ipv4Addr>,
+    targets: Vec<OpenTarget>,
     source_ip: Ipv4Addr,
     cfg: &Config,
     scan_id: &str,
+    budget: AsyncTokenBucket,
 ) -> anyhow::Result<()> {
     use tokio::{sync::Semaphore, task::JoinSet, time};
     let sem = Arc::new(Semaphore::new(cfg.scan.banner_concurrency));
@@ -158,20 +159,69 @@ async fn banner_pipeline(
         1.0 / f64::from(cfg.scan.banner_connects_per_second.max(1)),
     ));
     let mut tasks = JoinSet::new();
-    for ip in targets {
+    for target in targets {
         ticker.tick().await;
         let permit = sem.clone().acquire_owned().await?;
         let scan = cfg.scan.clone();
         let scan_id = scan_id.to_owned();
+        let budget = budget.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            inspect_banner(&scan_id, ip, source_ip, &scan).await
+            inspect_banner(
+                &scan_id,
+                target.ip,
+                source_ip,
+                &scan,
+                target.observation,
+                &budget,
+            )
+            .await
         });
     }
     while let Some(result) = tasks.join_next().await {
         crate::job::append_event(job_dir, &result??)?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct OpenTarget {
+    ip: Ipv4Addr,
+    observation: SynObservation,
+}
+
+#[derive(Clone, Copy)]
+struct SynObservation {
+    attempts: u8,
+    rtt_ms: Option<f64>,
+    conflicting_observations: u32,
+}
+
+#[derive(Clone)]
+struct AsyncTokenBucket {
+    inner: Arc<tokio::sync::Mutex<crate::rate::TokenBucket>>,
+    start: std::time::Instant,
+}
+
+impl AsyncTokenBucket {
+    fn new(bucket: crate::rate::TokenBucket, start: std::time::Instant) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(bucket)),
+            start,
+        }
+    }
+
+    async fn consume(&self, bytes: u64) {
+        let wait = self.reserve(bytes).await;
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn reserve(&self, bytes: u64) -> Duration {
+        let mut bucket = self.inner.lock().await;
+        bucket.consume_at(bytes, self.start.elapsed().as_secs_f64())
+    }
 }
 
 struct BannerObservation {
@@ -185,6 +235,8 @@ async fn inspect_banner(
     ip: Ipv4Addr,
     source_ip: Ipv4Addr,
     scan: &crate::config::ScanConfig,
+    syn: SynObservation,
+    budget: &AsyncTokenBucket,
 ) -> anyhow::Result<crate::ResultV1> {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let mut observation = BannerObservation {
@@ -193,6 +245,7 @@ async fn inspect_banner(
         parsed: None,
     };
     for _ in 0..scan.banner_attempts {
+        budget.consume(SYN_WIRE_BYTES).await;
         let mut stream = match connect_banner(ip, source_ip, scan).await? {
             Ok(stream) => stream,
             Err(status) => {
@@ -213,7 +266,7 @@ async fn inspect_banner(
             break;
         }
     }
-    Ok(make_result(scan_id, ip, scan, observation))
+    Ok(make_result(scan_id, ip, scan, syn, observation))
 }
 
 async fn connect_banner(
@@ -285,6 +338,7 @@ fn make_result(
     scan_id: &str,
     ip: Ipv4Addr,
     scan: &crate::config::ScanConfig,
+    syn: SynObservation,
     observation: BannerObservation,
 ) -> crate::ResultV1 {
     let observed = std::time::SystemTime::now()
@@ -301,8 +355,9 @@ fn make_result(
         port: scan.port,
         protocol: scan.protocol,
         state: crate::TargetState::Open,
-        syn_attempts: 0,
-        rtt_ms: None,
+        syn_attempts: syn.attempts,
+        rtt_ms: syn.rtt_ms,
+        conflicting_observations: syn.conflicting_observations,
         first_observed_at: Some(observed.clone()),
         last_observed_at: Some(observed),
         banner_status: Some(observation.status),
@@ -318,11 +373,19 @@ fn make_result(
 pub struct ScanSummary {
     pub completed: bool,
     pub sent: u64,
+    #[serde(default)]
+    pub syn_mss: Option<u16>,
     pub open: u64,
     pub closed: u64,
     pub unreachable: u64,
     pub no_response: u64,
     pub pcap_drops: u64,
+    #[serde(default)]
+    pub conflicting_observations: u64,
+    #[serde(default)]
+    pub interface_tx_packets: Option<u64>,
+    #[serde(default)]
+    pub interface_tx_bytes: Option<u64>,
 }
 
 fn final_checkpoint_index(completed: bool, target_count: u64, next_index: u64) -> u64 {
@@ -333,10 +396,13 @@ fn final_checkpoint_index(completed: bool, target_count: u64, next_index: u64) -
 mod linux {
     use super::*;
     use crate::{packet, rate::TokenBucket};
+    use anyhow::Context;
     use memmap2::Mmap;
     use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
     use std::{
         fs::File,
+        mem,
+        os::fd::AsRawFd,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -358,10 +424,15 @@ mod linux {
     }
     struct ReplyContext<'a> {
         states: &'a mut [u8],
+        rtts: &'a mut [u8],
+        conflicts: &'a mut [u8],
+        sent_times: &'a [u8],
         targets: &'a [u8],
         secret: &'a [u8; 32],
         src: Ipv4Addr,
         scan: &'a crate::config::ScanConfig,
+        syn_attempts: u8,
+        now_ms: u32,
     }
 
     fn receive(cap: &mut pcap::Capture<pcap::Active>, context: &mut ReplyContext<'_>) {
@@ -433,9 +504,9 @@ mod linux {
         };
         let flags = data[tcp + 13];
         if flags & 0x12 == 0x12 {
-            context.states[index] = 3;
-        } else if flags & 0x04 != 0 && context.states[index] < 2 {
-            context.states[index] = 2;
+            observe_response(context, index, crate::TargetState::Open);
+        } else if flags & 0x04 != 0 {
+            observe_response(context, index, crate::TargetState::Closed);
         }
     }
 
@@ -451,8 +522,62 @@ mod linux {
             return;
         }
         if let Some(index) = find_index(context.targets, reply.remote) {
-            context.states[index] = context.states[index].max(1);
+            observe_response(context, index, crate::TargetState::Unreachable);
         }
+    }
+
+    fn observe_response(context: &mut ReplyContext<'_>, index: usize, state: crate::TargetState) {
+        let current = decoded_state(context.states[index]);
+        if current != crate::TargetState::NoResponse && current != state {
+            increment_u32(context.conflicts, index);
+        }
+        if state.rank() > current.rank() {
+            context.states[index] = crate::result::encode_state_byte(state, context.syn_attempts);
+        }
+        if read_u32(context.rtts, index) == 0 {
+            if let Some(rtt_us) = response_rtt_us(context.sent_times, index, context.now_ms) {
+                write_u32(context.rtts, index, rtt_us.saturating_add(1));
+            }
+        }
+    }
+
+    fn response_rtt_us(sent_times: &[u8], index: usize, now_ms: u32) -> Option<u32> {
+        let sent_ms = read_u32(sent_times, index);
+        (sent_ms != 0).then(|| now_ms.wrapping_sub(sent_ms).saturating_mul(1000))
+    }
+
+    fn state_rank(value: u8) -> u8 {
+        decoded_state(value).rank()
+    }
+
+    fn decoded_state(value: u8) -> crate::TargetState {
+        crate::result::decode_state_byte(value)
+            .map(|(state, _)| state)
+            .unwrap_or(crate::TargetState::NoResponse)
+    }
+
+    fn read_u32(data: &[u8], index: usize) -> u32 {
+        let offset = index * 4;
+        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn write_u32(data: &mut [u8], index: usize, value: u32) {
+        let offset = index * 4;
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn increment_u32(data: &mut [u8], index: usize) {
+        write_u32(data, index, read_u32(data, index).saturating_add(1));
+    }
+
+    fn elapsed_ms(start: Instant) -> u32 {
+        let millis = start.elapsed().as_millis();
+        millis.min(u128::from(u32::MAX)) as u32
+    }
+
+    fn decode_rtt_ms(rtts: &[u8], index: usize) -> Option<f64> {
+        let stored = read_u32(rtts, index);
+        (stored != 0).then(|| f64::from(stored - 1) / 1000.0)
     }
 
     fn inner_tcp_reply(data: &[u8], inner: usize) -> Option<InnerTcpReply> {
@@ -505,7 +630,47 @@ mod linux {
         stopping: Arc<AtomicBool>,
         start: Instant,
         bucket: TokenBucket,
+        tx_start: TxStats,
+        mss: u16,
     }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TxStats {
+        packets: u64,
+        bytes: u64,
+    }
+
+    impl TxStats {
+        fn delta(self, end: Self) -> Self {
+            Self {
+                packets: end.packets.saturating_sub(self.packets),
+                bytes: end.bytes.saturating_sub(self.bytes),
+            }
+        }
+    }
+
+    struct ScanBuffers<'a> {
+        targets: &'a [u8],
+        states: &'a mut [u8],
+        rtts: &'a mut [u8],
+        sent_times: &'a mut [u8],
+        conflicts: &'a mut [u8],
+    }
+
+    struct ScanMaps {
+        targets: Mmap,
+        states: memmap2::MmapMut,
+        rtts: memmap2::MmapMut,
+        sent_times: memmap2::MmapMut,
+        conflicts: memmap2::MmapMut,
+    }
+
+    struct PreparedSyn {
+        ip: Ipv4Addr,
+        packet: Vec<u8>,
+    }
+
+    const SENDMMSG_BATCH: usize = 64;
 
     fn scan_runtime(job: &PreparedJob, cfg: &Config) -> anyhow::Result<ScanRuntime> {
         let source_ip = resolve_source_ip(cfg)?;
@@ -514,6 +679,10 @@ mod linux {
         let perm = Permutation::new(job.meta.target_count, seed)?;
         let cap = capture_socket(cfg)?;
         let raw = raw_socket(cfg)?;
+        let tx_start = interface_tx_stats(Path::new("/sys/class/net"), &cfg.network.interface)
+            .context("read starting interface TX counters")?;
+        let mss = interface_mss(Path::new("/sys/class/net"), &cfg.network.interface)
+            .context("derive SYN MSS from interface MTU")?;
         let rate =
             cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio;
         let stopping = Arc::new(AtomicBool::new(false));
@@ -527,6 +696,8 @@ mod linux {
             stopping,
             start: Instant::now(),
             bucket: TokenBucket::new(rate, 0.1),
+            tx_start,
+            mss,
         })
     }
 
@@ -553,6 +724,33 @@ mod linux {
         Ok(cap.setnonblock()?)
     }
 
+    fn interface_tx_stats(root: &Path, interface: &str) -> anyhow::Result<TxStats> {
+        let stats = root.join(interface).join("statistics");
+        Ok(TxStats {
+            packets: read_counter(&stats.join("tx_packets"))?,
+            bytes: read_counter(&stats.join("tx_bytes"))?,
+        })
+    }
+
+    fn read_counter(path: &Path) -> anyhow::Result<u64> {
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        Ok(raw.trim().parse()?)
+    }
+
+    fn interface_mss(root: &Path, interface: &str) -> anyhow::Result<u16> {
+        let raw = std::fs::read_to_string(root.join(interface).join("mtu"))?;
+        mss_from_mtu(raw.trim().parse()?)
+    }
+
+    fn mss_from_mtu(mtu: u32) -> anyhow::Result<u16> {
+        let mss = mtu
+            .checked_sub(40)
+            .ok_or_else(|| anyhow::anyhow!("interface MTU {mtu} is too small for IPv4/TCP"))?;
+        anyhow::ensure!(mss > 0, "interface MTU {mtu} leaves zero TCP payload MSS");
+        Ok(mss.min(u32::from(u16::MAX)) as u16)
+    }
+
     fn raw_socket(cfg: &Config) -> anyhow::Result<Socket> {
         let raw = Socket::new(Domain::IPV4, Type::RAW, Some(SockProtocol::TCP))?;
         raw.set_header_included_v4(true)?;
@@ -571,8 +769,31 @@ mod linux {
         let target_file = File::open(job.dir.join("targets.bin"))?;
         let targets = unsafe { Mmap::map(&target_file)? };
         let mut states = job.states()?;
-        send_rounds(job, cfg, &mut runtime, &targets, &mut states)?;
-        let summary = finish_scan(job, cfg, &mut runtime, targets, states)?;
+        let mut rtts = job.rtts()?;
+        let mut sent_times = job.sent_times()?;
+        let mut conflicts = job.conflicts()?;
+        {
+            let mut buffers = ScanBuffers {
+                targets: &targets,
+                states: &mut states,
+                rtts: &mut rtts,
+                sent_times: &mut sent_times,
+                conflicts: &mut conflicts,
+            };
+            send_rounds(job, cfg, &mut runtime, &mut buffers)?;
+        }
+        let summary = finish_scan(
+            job,
+            cfg,
+            &mut runtime,
+            ScanMaps {
+                targets,
+                states,
+                rtts,
+                sent_times,
+                conflicts,
+            },
+        )?;
         Ok(summary)
     }
 
@@ -580,8 +801,7 @@ mod linux {
         job: &mut PreparedJob,
         cfg: &Config,
         runtime: &mut ScanRuntime,
-        targets: &[u8],
-        states: &mut [u8],
+        buffers: &mut ScanBuffers<'_>,
     ) -> anyhow::Result<()> {
         'rounds: for round in job.meta.round..cfg.scan.syn_attempts {
             let start_order = if round == job.meta.round {
@@ -590,88 +810,170 @@ mod linux {
                 0
             };
             job.meta.round = round;
-            for order in start_order..job.meta.target_count {
+            let mut order = start_order;
+            while order < job.meta.target_count {
                 if runtime.stopping.load(Ordering::SeqCst) {
                     job.checkpoint(order)?;
                     break 'rounds;
                 }
-                if send_target(order, cfg, runtime, targets, states)? {
-                    job.meta.packets_sent = job.meta.packets_sent.saturating_add(1);
+                let batch = prepare_syn_batch(&mut order, cfg, runtime, buffers);
+                if !batch.is_empty() {
+                    let sent = send_syn_batch(&runtime.raw, cfg.scan.port, &batch)?;
+                    job.meta.packets_sent = job.meta.packets_sent.saturating_add(sent as u64);
                 }
-                receive_replies(cfg, runtime, targets, states);
+                receive_replies(cfg, runtime, buffers, round + 1);
                 // Persist periodically; an atomic fsync per target makes large
                 // scans unusable. Ctrl+C always writes the exact next index.
-                if (order + 1) % 10_000 == 0 {
-                    job.checkpoint(order + 1)?;
+                if order % 10_000 == 0 {
+                    job.checkpoint(order)?;
                 }
             }
             job.meta.round = round + 1;
             job.checkpoint(0)?;
             if round + 1 < cfg.scan.syn_attempts {
-                pause_between_rounds(cfg, runtime, targets, states);
+                pause_between_rounds(cfg, runtime, buffers, round + 1);
             }
         }
         Ok(())
     }
 
-    fn send_target(
-        order: u64,
+    fn prepare_syn_batch(
+        order: &mut u64,
         cfg: &Config,
         runtime: &mut ScanRuntime,
-        targets: &[u8],
-        states: &[u8],
-    ) -> anyhow::Result<bool> {
-        let idx = runtime.perm.get(order) as usize;
-        if states[idx] != 0 {
-            return Ok(false);
+        buffers: &mut ScanBuffers<'_>,
+    ) -> Vec<PreparedSyn> {
+        let mut batch = Vec::with_capacity(SENDMMSG_BATCH);
+        while *order < buffers.states.len() as u64 && batch.len() < SENDMMSG_BATCH {
+            let idx = runtime.perm.get(*order) as usize;
+            *order += 1;
+            if state_rank(buffers.states[idx]) != crate::TargetState::NoResponse.rank() {
+                continue;
+            }
+            let ip = target_ip(buffers.targets, idx);
+            let wait = runtime.bucket.consume_at(
+                packet::SYN_WIRE_BYTES,
+                runtime.start.elapsed().as_secs_f64(),
+            );
+            if !wait.is_zero() {
+                thread::sleep(wait);
+            }
+            write_u32(buffers.sent_times, idx, elapsed_ms(runtime.start));
+            let seq = packet::syn_cookie(
+                &runtime.seed,
+                runtime.source_ip,
+                ip,
+                cfg.scan.source_port,
+                cfg.scan.port,
+            );
+            batch.push(PreparedSyn {
+                ip,
+                packet: packet::SynPacket {
+                    src: runtime.source_ip,
+                    dst: ip,
+                    source_port: cfg.scan.source_port,
+                    dest_port: cfg.scan.port,
+                    seq,
+                    mss: runtime.mss,
+                }
+                .encode(),
+            });
         }
-        let ip = target_ip(targets, idx);
-        let wait = runtime.bucket.consume_at(
-            packet::SYN_WIRE_BYTES,
-            runtime.start.elapsed().as_secs_f64(),
-        );
-        if !wait.is_zero() {
-            thread::sleep(wait);
+        batch
+    }
+
+    fn send_syn_batch(raw: &Socket, port: u16, batch: &[PreparedSyn]) -> anyhow::Result<usize> {
+        let mut sent = 0;
+        while sent < batch.len() {
+            sent += sendmmsg_once(raw, port, &batch[sent..])?;
         }
-        let seq = packet::syn_cookie(
-            &runtime.seed,
-            runtime.source_ip,
-            ip,
-            cfg.scan.source_port,
-            cfg.scan.port,
-        );
-        let packet = packet::SynPacket {
-            src: runtime.source_ip,
-            dst: ip,
-            source_port: cfg.scan.source_port,
-            dest_port: cfg.scan.port,
-            seq,
-            mss: 1460,
+        Ok(sent)
+    }
+
+    fn sendmmsg_once(raw: &Socket, port: u16, batch: &[PreparedSyn]) -> anyhow::Result<usize> {
+        let mut addrs = batch
+            .iter()
+            .map(|syn| sockaddr_in(syn.ip, port))
+            .collect::<Vec<_>>();
+        let mut iovecs = batch
+            .iter()
+            .map(|syn| libc::iovec {
+                iov_base: syn.packet.as_ptr() as *mut libc::c_void,
+                iov_len: syn.packet.len(),
+            })
+            .collect::<Vec<_>>();
+        let mut messages = addrs
+            .iter_mut()
+            .zip(iovecs.iter_mut())
+            .map(|(addr, iov)| {
+                let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
+                hdr.msg_name = addr as *mut libc::sockaddr_in as *mut libc::c_void;
+                hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                hdr.msg_iov = iov;
+                hdr.msg_iovlen = 1;
+                libc::mmsghdr {
+                    msg_hdr: hdr,
+                    msg_len: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        loop {
+            let sent = unsafe {
+                libc::sendmmsg(
+                    raw.as_raw_fd(),
+                    messages.as_mut_ptr(),
+                    messages.len() as libc::c_uint,
+                    0,
+                )
+            };
+            if sent >= 0 {
+                return Ok(sent as usize);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
         }
-        .encode();
-        runtime
-            .raw
-            .send_to(&packet, &SocketAddrV4::new(ip, cfg.scan.port).into())?;
-        Ok(true)
+    }
+
+    fn sockaddr_in(ip: Ipv4Addr, port: u16) -> libc::sockaddr_in {
+        libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(ip.octets()),
+            },
+            sin_zero: [0; 8],
+        }
     }
 
     fn pause_between_rounds(
         cfg: &Config,
         runtime: &mut ScanRuntime,
-        targets: &[u8],
-        states: &mut [u8],
+        buffers: &mut ScanBuffers<'_>,
+        syn_attempts: u8,
     ) {
         thread::sleep(Duration::from_secs(1));
-        receive_replies(cfg, runtime, targets, states);
+        receive_replies(cfg, runtime, buffers, syn_attempts);
     }
 
-    fn receive_replies(cfg: &Config, runtime: &mut ScanRuntime, targets: &[u8], states: &mut [u8]) {
+    fn receive_replies(
+        cfg: &Config,
+        runtime: &mut ScanRuntime,
+        buffers: &mut ScanBuffers<'_>,
+        syn_attempts: u8,
+    ) {
         let mut context = ReplyContext {
-            states,
-            targets,
+            states: buffers.states,
+            rtts: buffers.rtts,
+            conflicts: buffers.conflicts,
+            sent_times: buffers.sent_times,
+            targets: buffers.targets,
             secret: &runtime.seed,
             src: runtime.source_ip,
             scan: &cfg.scan,
+            syn_attempts,
+            now_ms: elapsed_ms(runtime.start),
         };
         receive(&mut runtime.cap, &mut context);
     }
@@ -680,29 +982,45 @@ mod linux {
         job: &mut PreparedJob,
         cfg: &Config,
         runtime: &mut ScanRuntime,
-        targets: Mmap,
-        mut states: memmap2::MmapMut,
+        mut maps: ScanMaps,
     ) -> anyhow::Result<ScanSummary> {
         thread::sleep(Duration::from_secs(1));
-        receive_replies(cfg, runtime, &targets, &mut states);
-        states.flush()?;
+        {
+            let mut buffers = ScanBuffers {
+                targets: &maps.targets,
+                states: &mut maps.states,
+                rtts: &mut maps.rtts,
+                sent_times: &mut maps.sent_times,
+                conflicts: &mut maps.conflicts,
+            };
+            receive_replies(cfg, runtime, &mut buffers, current_attempt(job, cfg));
+        }
+        maps.states.flush()?;
+        maps.rtts.flush()?;
+        maps.conflicts.flush()?;
         record_capture_stats(job, &mut runtime.cap)?;
         let completed = job.meta.round >= cfg.scan.syn_attempts;
         let next_index =
             final_checkpoint_index(completed, job.meta.target_count, job.meta.next_index);
         job.checkpoint(next_index)?;
-        let summary = summarize_states(completed, job, &states);
-        let open_targets = open_targets(&targets, &states);
-        drop(states);
-        drop(targets);
-        crate::job::save_summary(&job.dir, &summary)?;
+        let mut summary = summarize_states(completed, job, &maps.states, &maps.conflicts);
+        summary.syn_mss = Some(runtime.mss);
+        let open_targets = open_targets(&maps.targets, &maps.states, &maps.rtts, &maps.conflicts);
+        drop(maps);
         tokio::runtime::Runtime::new()?.block_on(banner_pipeline(
             &job.dir,
             open_targets,
             runtime.source_ip,
             cfg,
             &job.meta.scan_id,
+            AsyncTokenBucket::new(runtime.bucket.clone(), runtime.start),
         ))?;
+        let tx_end = interface_tx_stats(Path::new("/sys/class/net"), &cfg.network.interface)
+            .context("read ending interface TX counters")?;
+        let tx_delta = runtime.tx_start.delta(tx_end);
+        summary.interface_tx_packets = Some(tx_delta.packets);
+        summary.interface_tx_bytes = Some(tx_delta.bytes);
+        crate::job::save_summary(&job.dir, &summary)?;
         Ok(summary)
     }
 
@@ -717,7 +1035,20 @@ mod linux {
         Ok(())
     }
 
-    fn summarize_states(completed: bool, job: &PreparedJob, states: &[u8]) -> ScanSummary {
+    fn current_attempt(job: &PreparedJob, cfg: &Config) -> u8 {
+        if job.meta.round >= cfg.scan.syn_attempts {
+            cfg.scan.syn_attempts
+        } else {
+            job.meta.round + 1
+        }
+    }
+
+    fn summarize_states(
+        completed: bool,
+        job: &PreparedJob,
+        states: &[u8],
+        conflicts: &[u8],
+    ) -> ScanSummary {
         let mut summary = ScanSummary {
             completed,
             sent: job.meta.packets_sent,
@@ -725,20 +1056,40 @@ mod linux {
             ..Default::default()
         };
         for &v in states {
-            match v {
-                3 => summary.open += 1,
-                2 => summary.closed += 1,
-                1 => summary.unreachable += 1,
-                _ => summary.no_response += 1,
+            match crate::result::decode_state_byte(v)
+                .map(|(state, _)| state)
+                .unwrap_or(crate::TargetState::NoResponse)
+            {
+                crate::TargetState::Open => summary.open += 1,
+                crate::TargetState::Closed => summary.closed += 1,
+                crate::TargetState::Unreachable => summary.unreachable += 1,
+                crate::TargetState::NoResponse => summary.no_response += 1,
             }
+        }
+        for index in 0..states.len() {
+            summary.conflicting_observations += u64::from(read_u32(conflicts, index));
         }
         summary
     }
 
-    fn open_targets(targets: &[u8], states: &[u8]) -> Vec<Ipv4Addr> {
+    fn open_targets(
+        targets: &[u8],
+        states: &[u8],
+        rtts: &[u8],
+        conflicts: &[u8],
+    ) -> Vec<OpenTarget> {
         (0..states.len())
-            .filter(|&i| states[i] == 3)
-            .map(|i| target_ip(targets, i))
+            .filter_map(|i| {
+                let (state, attempts) = crate::result::decode_state_byte(states[i]).ok()?;
+                (state == crate::TargetState::Open).then_some(OpenTarget {
+                    ip: target_ip(targets, i),
+                    observation: SynObservation {
+                        attempts,
+                        rtt_ms: decode_rtt_ms(rtts, i),
+                        conflicting_observations: read_u32(conflicts, i),
+                    },
+                })
+            })
             .collect()
     }
 
@@ -804,6 +1155,89 @@ mod linux {
             frame[14..16].copy_from_slice(&[0x08, 0x00]);
             frame.append(&mut packet);
             frame
+        }
+
+        fn assert_state(value: u8, expected: crate::TargetState, attempts: u8) {
+            assert_eq!(
+                crate::result::decode_state_byte(value).unwrap(),
+                (expected, attempts)
+            );
+        }
+
+        #[test]
+        fn tx_stats_delta_saturates_on_counter_reset() {
+            let start = TxStats {
+                packets: 100,
+                bytes: 1000,
+            };
+
+            assert_eq!(
+                start.delta(TxStats {
+                    packets: 125,
+                    bytes: 1500,
+                }),
+                TxStats {
+                    packets: 25,
+                    bytes: 500,
+                }
+            );
+            assert_eq!(
+                start.delta(TxStats {
+                    packets: 90,
+                    bytes: 900,
+                }),
+                TxStats {
+                    packets: 0,
+                    bytes: 0,
+                }
+            );
+        }
+
+        #[test]
+        fn reads_interface_tx_stats_from_sysfs_shape() -> anyhow::Result<()> {
+            let temp = tempfile::tempdir()?;
+            let stats = temp.path().join("eth-test").join("statistics");
+            std::fs::create_dir_all(&stats)?;
+            std::fs::write(stats.join("tx_packets"), "42\n")?;
+            std::fs::write(stats.join("tx_bytes"), "9001\n")?;
+
+            assert_eq!(
+                interface_tx_stats(temp.path(), "eth-test")?,
+                TxStats {
+                    packets: 42,
+                    bytes: 9001,
+                }
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn derives_mss_from_interface_mtu() -> anyhow::Result<()> {
+            assert_eq!(mss_from_mtu(1500)?, 1460);
+            assert_eq!(mss_from_mtu(1280)?, 1240);
+            assert_eq!(mss_from_mtu(9000)?, 8960);
+            assert!(mss_from_mtu(40).is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn reads_interface_mss_from_sysfs_shape() -> anyhow::Result<()> {
+            let temp = tempfile::tempdir()?;
+            let interface = temp.path().join("eth-test");
+            std::fs::create_dir_all(&interface)?;
+            std::fs::write(interface.join("mtu"), "1500\n")?;
+
+            assert_eq!(interface_mss(temp.path(), "eth-test")?, 1460);
+            Ok(())
+        }
+
+        #[test]
+        fn sockaddr_in_preserves_network_order_fields() {
+            let addr = sockaddr_in(Ipv4Addr::new(198, 51, 100, 20), 22);
+
+            assert_eq!(addr.sin_family, libc::AF_INET as libc::sa_family_t);
+            assert_eq!(addr.sin_port, 22u16.to_be());
+            assert_eq!(addr.sin_addr.s_addr.to_ne_bytes(), [198, 51, 100, 20]);
         }
 
         #[test]
@@ -872,18 +1306,28 @@ mod linux {
             let packet = ethernet_ipv4(ipv4_packet(6, remote, src, &tcp));
             let (offset, ihl, _) = ipv4_header(&packet).unwrap();
             let mut states = [0];
+            let mut rtts = [0; 4];
+            let mut conflicts = [0; 4];
+            let mut sent_times = [0; 4];
+            write_u32(&mut sent_times, 0, 90);
             let targets = remote.octets();
             let mut context = ReplyContext {
                 states: &mut states,
+                rtts: &mut rtts,
+                conflicts: &mut conflicts,
+                sent_times: &sent_times,
                 targets: &targets,
                 secret: &secret,
                 src,
                 scan: &scan,
+                syn_attempts: 1,
+                now_ms: 100,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
 
-            assert_eq!(states[0], 3);
+            assert_state(states[0], crate::TargetState::Open, 1);
+            assert_eq!(decode_rtt_ms(&rtts, 0), Some(10.0));
         }
 
         #[test]
@@ -897,18 +1341,28 @@ mod linux {
             let packet = sll_ipv4(ipv4_packet(6, remote, src, &tcp));
             let (offset, ihl, _) = ipv4_header(&packet).unwrap();
             let mut states = [0];
+            let mut rtts = [0; 4];
+            let mut conflicts = [0; 4];
+            let mut sent_times = [0; 4];
+            write_u32(&mut sent_times, 0, 80);
             let targets = remote.octets();
             let mut context = ReplyContext {
                 states: &mut states,
+                rtts: &mut rtts,
+                conflicts: &mut conflicts,
+                sent_times: &sent_times,
                 targets: &targets,
                 secret: &secret,
                 src,
                 scan: &scan,
+                syn_attempts: 1,
+                now_ms: 100,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
 
-            assert_eq!(states[0], 3);
+            assert_state(states[0], crate::TargetState::Open, 1);
+            assert_eq!(decode_rtt_ms(&rtts, 0), Some(20.0));
         }
 
         #[test]
@@ -922,18 +1376,77 @@ mod linux {
             let packet = sll_ipv4(ipv4_packet(6, remote, src, &tcp));
             let (offset, ihl, _) = ipv4_header(&packet).unwrap();
             let mut states = [0];
+            let mut rtts = [0; 4];
+            let mut conflicts = [0; 4];
+            let mut sent_times = [0; 4];
+            write_u32(&mut sent_times, 0, 75);
             let targets = remote.octets();
             let mut context = ReplyContext {
                 states: &mut states,
+                rtts: &mut rtts,
+                conflicts: &mut conflicts,
+                sent_times: &sent_times,
                 targets: &targets,
                 secret: &secret,
                 src,
                 scan: &scan,
+                syn_attempts: 1,
+                now_ms: 100,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
 
-            assert_eq!(states[0], 2);
+            assert_state(states[0], crate::TargetState::Closed, 1);
+            assert_eq!(decode_rtt_ms(&rtts, 0), Some(25.0));
+        }
+
+        #[test]
+        fn conflicting_tcp_observation_is_counted_without_downgrade() {
+            let src = Ipv4Addr::new(192, 0, 2, 10);
+            let remote = Ipv4Addr::new(198, 51, 100, 20);
+            let secret = [7; 32];
+            let scan = scan_config();
+            let cookie = packet::syn_cookie(&secret, src, remote, scan.source_port, scan.port);
+            let syn_ack = sll_ipv4(ipv4_packet(
+                6,
+                remote,
+                src,
+                &tcp_segment(scan.port, scan.source_port, 0, cookie.wrapping_add(1), 0x12),
+            ));
+            let rst = sll_ipv4(ipv4_packet(
+                6,
+                remote,
+                src,
+                &tcp_segment(scan.port, scan.source_port, 0, cookie.wrapping_add(1), 0x04),
+            ));
+            let (syn_offset, syn_ihl, _) = ipv4_header(&syn_ack).unwrap();
+            let (rst_offset, rst_ihl, _) = ipv4_header(&rst).unwrap();
+            let mut states = [0];
+            let mut rtts = [0; 4];
+            let mut conflicts = [0; 4];
+            let mut sent_times = [0; 4];
+            write_u32(&mut sent_times, 0, 90);
+            let targets = remote.octets();
+            let mut context = ReplyContext {
+                states: &mut states,
+                rtts: &mut rtts,
+                conflicts: &mut conflicts,
+                sent_times: &sent_times,
+                targets: &targets,
+                secret: &secret,
+                src,
+                scan: &scan,
+                syn_attempts: 1,
+                now_ms: 100,
+            };
+
+            handle_tcp_reply(&syn_ack, syn_offset, syn_ihl, &mut context);
+            context.now_ms = 110;
+            handle_tcp_reply(&rst, rst_offset, rst_ihl, &mut context);
+
+            assert_state(states[0], crate::TargetState::Open, 1);
+            assert_eq!(read_u32(&conflicts, 0), 1);
+            assert_eq!(decode_rtt_ms(&rtts, 0), Some(10.0));
         }
 
         #[test]
@@ -951,29 +1464,53 @@ mod linux {
             let packet = sll_ipv4(ipv4_packet(1, router, src, &icmp));
             let (offset, ihl, _) = ipv4_header(&packet).unwrap();
             let mut states = [0];
+            let mut rtts = [0; 4];
+            let mut conflicts = [0; 4];
+            let mut sent_times = [0; 4];
+            write_u32(&mut sent_times, 0, 50);
             let targets = remote.octets();
             let mut context = ReplyContext {
                 states: &mut states,
+                rtts: &mut rtts,
+                conflicts: &mut conflicts,
+                sent_times: &sent_times,
                 targets: &targets,
                 secret: &secret,
                 src,
                 scan: &scan,
+                syn_attempts: 1,
+                now_ms: 100,
             };
 
             handle_icmp_reply(&packet, offset, ihl, &mut context);
 
-            assert_eq!(states[0], 1);
+            assert_state(states[0], crate::TargetState::Unreachable, 1);
+            assert_eq!(decode_rtt_ms(&rtts, 0), Some(50.0));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::final_checkpoint_index;
+    use super::{AsyncTokenBucket, final_checkpoint_index};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn interrupted_scan_preserves_resume_index() {
         assert_eq!(final_checkpoint_index(false, 100, 37), 37);
         assert_eq!(final_checkpoint_index(true, 100, 0), 100);
+    }
+
+    #[test]
+    fn async_token_bucket_shares_reserved_budget() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let budget =
+                AsyncTokenBucket::new(crate::rate::TokenBucket::new(100.0, 1.0), Instant::now());
+
+            assert_eq!(budget.reserve(100).await, Duration::ZERO);
+            assert!(budget.reserve(50).await >= Duration::from_millis(400));
+            assert!(budget.reserve(50).await >= Duration::from_millis(900));
+        });
     }
 }

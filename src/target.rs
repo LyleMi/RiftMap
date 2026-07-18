@@ -25,8 +25,10 @@ pub fn parse_files(paths: &[impl AsRef<Path>]) -> anyhow::Result<Vec<Ipv4Range>>
             if line.is_empty() {
                 continue;
             }
-            ranges
-                .push(parse_entry(line).with_context(|| format!("{}:{}", path.display(), i + 1))?);
+            ranges.extend(
+                parse_entry_targets(line)
+                    .with_context(|| format!("{}:{}", path.display(), i + 1))?,
+            );
         }
     }
     Ok(merge(ranges))
@@ -51,6 +53,30 @@ pub fn parse_entry(s: &str) -> anyhow::Result<Ipv4Range> {
         start: n & mask,
         end: (n & mask) | !mask,
     })
+}
+
+fn parse_entry_targets(s: &str) -> anyhow::Result<Vec<Ipv4Range>> {
+    let range = parse_entry(s)?;
+    let Some((_, prefix_s)) = s.split_once('/') else {
+        return Ok(vec![range]);
+    };
+    let prefix = prefix_s.parse::<u8>().context("invalid prefix")?;
+    if prefix <= 30 {
+        Ok(trim_last_address(range))
+    } else {
+        Ok(vec![range])
+    }
+}
+
+fn trim_last_address(range: Ipv4Range) -> Vec<Ipv4Range> {
+    if range.start < range.end {
+        vec![Ipv4Range {
+            start: range.start,
+            end: range.end - 1,
+        }]
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn merge(mut ranges: Vec<Ipv4Range>) -> Vec<Ipv4Range> {
@@ -193,5 +219,50 @@ mod tests {
         assert!(!is_allowed("10.0.0.1".parse().unwrap(), false));
         assert!(is_allowed("10.0.0.1".parse().unwrap(), true));
         assert!(!is_allowed("127.0.0.1".parse().unwrap(), true));
+    }
+
+    #[test]
+    fn cidr_targets_drop_subnet_directed_broadcast() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        fs::write(temp.path(), "198.51.100.0/30\n")?;
+
+        let ranges = parse_files(&[temp.path()])?;
+
+        assert_eq!(
+            ranges,
+            vec![Ipv4Range {
+                start: u32::from(Ipv4Addr::new(198, 51, 100, 0)),
+                end: u32::from(Ipv4Addr::new(198, 51, 100, 2)),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cidr_targets_preserve_point_to_point_prefixes() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        fs::write(temp.path(), "198.51.100.0/31\n")?;
+
+        let ranges = parse_files(&[temp.path()])?;
+
+        assert_eq!(count(&ranges), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_single_ip_keeps_dot_255_address() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        fs::write(temp.path(), "198.51.100.255\n")?;
+
+        let ranges = parse_files(&[temp.path()])?;
+
+        assert_eq!(
+            ranges,
+            vec![Ipv4Range {
+                start: u32::from(Ipv4Addr::new(198, 51, 100, 255)),
+                end: u32::from(Ipv4Addr::new(198, 51, 100, 255)),
+            }]
+        );
+        Ok(())
     }
 }

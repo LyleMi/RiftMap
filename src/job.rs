@@ -99,6 +99,22 @@ impl PreparedJob {
         writer.flush()?;
         let state = File::create(dir.join("state.bin"))?;
         state.set_len(count)?;
+        create_zeroed_file(
+            &dir.join("rtt_us.bin"),
+            count.checked_mul(4).context("rtt file length overflow")?,
+        )?;
+        create_zeroed_file(
+            &dir.join("sent_at_ms.bin"),
+            count
+                .checked_mul(4)
+                .context("send timestamp file length overflow")?,
+        )?;
+        create_zeroed_file(
+            &dir.join("conflicts.bin"),
+            count
+                .checked_mul(4)
+                .context("conflict count file length overflow")?,
+        )?;
         let meta = JobMeta {
             format_version: 1,
             scan_id,
@@ -131,11 +147,26 @@ impl PreparedJob {
         Ok(u32::from_be_bytes(b).into())
     }
     pub fn states(&self) -> anyhow::Result<MmapMut> {
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.dir.join("state.bin"))?;
-        unsafe { MmapMut::map_mut(&f).context("map state.bin") }
+        self.fixed_mmap("state.bin", self.meta.target_count)
+            .context("map state.bin")
+    }
+    pub fn rtts(&self) -> anyhow::Result<MmapMut> {
+        self.fixed_mmap("rtt_us.bin", self.meta.target_count * 4)
+            .context("map rtt_us.bin")
+    }
+    pub fn sent_times(&self) -> anyhow::Result<MmapMut> {
+        self.fixed_mmap("sent_at_ms.bin", self.meta.target_count * 4)
+            .context("map sent_at_ms.bin")
+    }
+    pub fn conflicts(&self) -> anyhow::Result<MmapMut> {
+        self.fixed_mmap("conflicts.bin", self.meta.target_count * 4)
+            .context("map conflicts.bin")
+    }
+    fn fixed_mmap(&self, name: &str, len: u64) -> anyhow::Result<MmapMut> {
+        let path = self.dir.join(name);
+        create_fixed_file(&path, len)?;
+        let f = OpenOptions::new().read(true).write(true).open(path)?;
+        unsafe { Ok(MmapMut::map_mut(&f)?) }
     }
     pub fn checkpoint(&mut self, next: u64) -> anyhow::Result<()> {
         self.meta.next_index = next;
@@ -156,6 +187,25 @@ fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         f.sync_all()?;
     }
     fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn create_fixed_file(path: &Path, len: u64) -> anyhow::Result<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    if file.metadata()?.len() != len {
+        file.set_len(len)?;
+    }
+    Ok(())
+}
+
+fn create_zeroed_file(path: &Path, len: u64) -> anyhow::Result<()> {
+    let file = File::create(path)?;
+    file.set_len(len)?;
     Ok(())
 }
 
@@ -226,11 +276,15 @@ fn synthesize_missing_results(
 
     let targets_path = dir.join("targets.bin");
     let states_path = dir.join("state.bin");
+    let rtts_path = dir.join("rtt_us.bin");
+    let conflicts_path = dir.join("conflicts.bin");
     let target_bytes = job
         .meta
         .target_count
         .checked_mul(4)
         .context("target file length overflow")?;
+    create_fixed_file(&rtts_path, target_bytes)?;
+    create_fixed_file(&conflicts_path, target_bytes)?;
     anyhow::ensure!(
         fs::metadata(&targets_path)?.len() == target_bytes,
         "targets.bin length does not match checkpoint target_count"
@@ -242,20 +296,22 @@ fn synthesize_missing_results(
 
     let mut targets = BufReader::new(File::open(targets_path)?);
     let mut states = BufReader::new(File::open(states_path)?);
+    let mut rtts = BufReader::new(File::open(rtts_path)?);
+    let mut conflicts = BufReader::new(File::open(conflicts_path)?);
     for _ in 0..job.meta.target_count {
         let mut target = [0; 4];
         let mut state = [0];
+        let mut rtt = [0; 4];
+        let mut conflict_count = [0; 4];
         targets.read_exact(&mut target)?;
         states.read_exact(&mut state)?;
+        rtts.read_exact(&mut rtt)?;
+        conflicts.read_exact(&mut conflict_count)?;
         let ip = Ipv4Addr::from(u32::from_be_bytes(target));
         let id = crate::result::result_id(&job.meta.scan_id, ip, cfg.scan.port);
-        let state = match state[0] {
-            3 => TargetState::Open,
-            2 => TargetState::Closed,
-            1 => TargetState::Unreachable,
-            0 => TargetState::NoResponse,
-            value => anyhow::bail!("invalid target state byte {value}"),
-        };
+        let (state, observed_attempts) = crate::result::decode_state_byte(state[0])?;
+        let rtt_ms = decode_rtt_ms(rtt);
+        let conflicting_observations = u32::from_le_bytes(conflict_count);
         by_id.entry(id.clone()).or_insert_with(|| ResultV1 {
             schema_version: crate::SCHEMA_VERSION,
             result_id: id,
@@ -264,15 +320,13 @@ fn synthesize_missing_results(
             port: cfg.scan.port,
             protocol: cfg.scan.protocol,
             state,
-            // A completed no-response target necessarily exhausted every
-            // round. The current state format does not preserve the exact
-            // response round for other outcomes, so keep their count unknown.
             syn_attempts: if state == TargetState::NoResponse {
                 cfg.scan.syn_attempts
             } else {
-                0
+                observed_attempts
             },
-            rtt_ms: None,
+            rtt_ms,
+            conflicting_observations,
             first_observed_at: None,
             last_observed_at: None,
             banner_status: None,
@@ -284,6 +338,11 @@ fn synthesize_missing_results(
         });
     }
     Ok(())
+}
+
+fn decode_rtt_ms(raw: [u8; 4]) -> Option<f64> {
+    let stored = u32::from_le_bytes(raw);
+    (stored != 0).then(|| f64::from(stored - 1) / 1000.0)
 }
 
 #[cfg(test)]
@@ -358,6 +417,57 @@ mod tests {
     }
 
     #[test]
+    fn output_all_preserves_observed_syn_attempts() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let include = temp.path().join("targets.txt");
+        fs::write(&include, "10.0.0.1\n10.0.0.2\n")?;
+        let cfg = config(temp.path(), include, true);
+        let mut job = PreparedJob::create(&cfg, Some([4; 32]))?;
+        {
+            let mut states = job.states()?;
+            states.copy_from_slice(&[
+                crate::result::encode_state_byte(TargetState::Unreachable, 1),
+                crate::result::encode_state_byte(TargetState::Closed, 2),
+            ]);
+            states.flush()?;
+            let mut rtts = job.rtts()?;
+            rtts[..4].copy_from_slice(&12_501u32.to_le_bytes());
+            rtts[4..8].copy_from_slice(&34_001u32.to_le_bytes());
+            rtts.flush()?;
+            let mut conflicts = job.conflicts()?;
+            conflicts[4..8].copy_from_slice(&1u32.to_le_bytes());
+            conflicts.flush()?;
+        }
+        job.meta.round = cfg.scan.syn_attempts;
+        job.checkpoint(job.meta.target_count)?;
+
+        assert_eq!(export(&job.dir, true)?, 2);
+        let results: Vec<ResultV1> = fs::read_to_string(job.dir.join("results.ndjson"))?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let attempts: BTreeMap<_, _> = results
+            .iter()
+            .map(|result| (result.state, result.syn_attempts))
+            .collect();
+        assert_eq!(attempts[&TargetState::Unreachable], 1);
+        assert_eq!(attempts[&TargetState::Closed], 2);
+        let rtts: BTreeMap<_, _> = results
+            .iter()
+            .map(|result| (result.state, result.rtt_ms))
+            .collect();
+        assert_eq!(rtts[&TargetState::Unreachable], Some(12.5));
+        assert_eq!(rtts[&TargetState::Closed], Some(34.0));
+        let conflicts: BTreeMap<_, _> = results
+            .iter()
+            .map(|result| (result.state, result.conflicting_observations))
+            .collect();
+        assert_eq!(conflicts[&TargetState::Unreachable], 0);
+        assert_eq!(conflicts[&TargetState::Closed], 1);
+        Ok(())
+    }
+
+    #[test]
     fn output_all_rejects_incomplete_scan() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let include = temp.path().join("targets.txt");
@@ -393,11 +503,15 @@ mod tests {
         let summary = crate::scanner::ScanSummary {
             completed: true,
             sent: 7,
+            syn_mss: Some(1460),
             open: 1,
             closed: 2,
             unreachable: 1,
             no_response: 3,
             pcap_drops: 0,
+            conflicting_observations: 2,
+            interface_tx_packets: Some(11),
+            interface_tx_bytes: Some(990),
         };
 
         save_summary(temp.path(), &summary)?;
