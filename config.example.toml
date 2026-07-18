@@ -9,6 +9,14 @@ banner_max_bytes = 4096
 banner_attempts = 2
 banner_concurrency = 512
 banner_connects_per_second = 200
+banner_queue_capacity = 8192
+# Optional protection only; time budgets below are for estimation and do not stop scans.
+# max_runtime_secs = 86400
+
+[budget]
+# Optional estimation inputs for large jobs.
+# time_budget_secs = 7200
+# expected_open_ratio = 0.01
 
 [targets]
 include = ["fixtures/targets.example.txt"]

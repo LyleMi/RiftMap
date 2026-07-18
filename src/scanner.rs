@@ -1,5 +1,8 @@
 use crate::{Config, job::PreparedJob, packet::SYN_WIRE_BYTES, permutation::Permutation};
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::{
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
+    path::PathBuf,
+};
 #[cfg(target_os = "linux")]
 use {
     base64::Engine,
@@ -21,11 +24,75 @@ pub fn estimate(cfg: &Config, count: u64) -> Estimate {
     let packets = count.saturating_mul(cfg.scan.syn_attempts as u64);
     let bytes = packets.saturating_mul(SYN_WIRE_BYTES);
     let bps = cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio;
+    let syn_seconds = bytes as f64 / bps;
+    let time_budget_secs = cfg.budget.time_budget_secs;
+    let required_syn_application_mbps =
+        time_budget_secs.map(|secs| bytes as f64 * 8.0 / secs as f64 / 1_000_000.0);
+    let recommended_provider_egress_mbps =
+        required_syn_application_mbps.map(|mbps| mbps / cfg.network.application_ratio);
+    let banner_worst_case_secs = f64::from(cfg.scan.banner_attempts)
+        * (cfg.scan.connect_timeout_ms + cfg.scan.banner_timeout_ms) as f64
+        / 1000.0;
+    let concurrency_limited_cps = if banner_worst_case_secs > 0.0 {
+        cfg.scan.banner_concurrency as f64 / banner_worst_case_secs
+    } else {
+        f64::INFINITY
+    };
+    let banner_capacity_cps =
+        f64::from(cfg.scan.banner_connects_per_second).min(concurrency_limited_cps);
+    let expected_open = cfg
+        .budget
+        .expected_open_ratio
+        .map(|ratio| count as f64 * ratio);
+    let banner_budget_capacity_open =
+        time_budget_secs.map(|secs| banner_capacity_cps * secs as f64);
+    let banner_seconds = expected_open.map(|open| {
+        if banner_capacity_cps > 0.0 {
+            open / banner_capacity_cps
+        } else {
+            f64::INFINITY
+        }
+    });
+    let estimated_total_seconds = banner_seconds.map(|banner| syn_seconds.max(banner));
+    let mut budget_warnings = Vec::new();
+    if let Some(secs) = time_budget_secs {
+        let budget = secs as f64;
+        if syn_seconds > budget {
+            budget_warnings.push("SYN bandwidth is insufficient for the time budget".into());
+        }
+        match expected_open {
+            Some(open) => {
+                if let Some(capacity) = banner_budget_capacity_open {
+                    if open > capacity {
+                        if f64::from(cfg.scan.banner_connects_per_second) <= concurrency_limited_cps
+                        {
+                            budget_warnings
+                                .push("banner_connects_per_second is insufficient".into());
+                        } else {
+                            budget_warnings
+                                .push("banner timeout/concurrency limits banner throughput".into());
+                        }
+                    }
+                }
+            }
+            None => budget_warnings
+                .push("expected_open_ratio is not configured; banner workload is unknown".into()),
+        }
+    }
     Estimate {
         targets: count,
         worst_packets: packets,
         estimated_wire_bytes: bytes,
-        minimum_seconds: bytes as f64 / bps,
+        minimum_seconds: syn_seconds,
+        syn_seconds,
+        required_syn_application_mbps,
+        recommended_provider_egress_mbps,
+        banner_capacity_cps,
+        banner_budget_capacity_open,
+        expected_open,
+        banner_seconds,
+        estimated_total_seconds,
+        budget_warnings,
     }
 }
 #[derive(Debug)]
@@ -34,6 +101,15 @@ pub struct Estimate {
     pub worst_packets: u64,
     pub estimated_wire_bytes: u64,
     pub minimum_seconds: f64,
+    pub syn_seconds: f64,
+    pub required_syn_application_mbps: Option<f64>,
+    pub recommended_provider_egress_mbps: Option<f64>,
+    pub banner_capacity_cps: f64,
+    pub banner_budget_capacity_open: Option<f64>,
+    pub expected_open: Option<f64>,
+    pub banner_seconds: Option<f64>,
+    pub estimated_total_seconds: Option<f64>,
+    pub budget_warnings: Vec<String>,
 }
 
 pub fn dry_run(job: &PreparedJob) -> anyhow::Result<String> {
@@ -146,46 +222,78 @@ pub fn scan(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> 
 }
 
 async fn banner_pipeline(
-    job_dir: &Path,
-    targets: Vec<OpenTarget>,
+    job_dir: PathBuf,
+    receiver: std::sync::mpsc::Receiver<Option<OpenTarget>>,
     source_ip: Ipv4Addr,
     cfg: &Config,
-    scan_id: &str,
+    scan_id: String,
     budget: AsyncTokenBucket,
+    banner_state_file: Arc<std::sync::Mutex<std::fs::File>>,
 ) -> anyhow::Result<()> {
     use tokio::{sync::Semaphore, task::JoinSet, time};
     let sem = Arc::new(Semaphore::new(cfg.scan.banner_concurrency));
     let mut ticker = time::interval(Duration::from_secs_f64(
-        1.0 / f64::from(cfg.scan.banner_connects_per_second.max(1)),
+        1.0 / f64::from(cfg.scan.banner_connects_per_second),
     ));
     let mut tasks = JoinSet::new();
-    for target in targets {
-        ticker.tick().await;
-        let permit = sem.clone().acquire_owned().await?;
-        let scan = cfg.scan.clone();
-        let scan_id = scan_id.to_owned();
-        let budget = budget.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            inspect_banner(
-                &scan_id,
-                target.ip,
-                source_ip,
-                &scan,
-                target.observation,
-                &budget,
-            )
-            .await
-        });
+    loop {
+        drain_completed_banner_tasks(&mut tasks, &job_dir, &banner_state_file).await?;
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Some(target)) => {
+                ticker.tick().await;
+                let permit = sem.clone().acquire_owned().await?;
+                let scan = cfg.scan.clone();
+                let scan_id = scan_id.clone();
+                let budget = budget.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let result = inspect_banner(
+                        &scan_id,
+                        target.ip,
+                        source_ip,
+                        &scan,
+                        target.observation,
+                        &budget,
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>((target.index, result))
+                });
+            }
+            Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
     }
-    while let Some(result) = tasks.join_next().await {
-        crate::job::append_event(job_dir, &result??)?;
+    while !tasks.is_empty() {
+        drain_completed_banner_tasks(&mut tasks, &job_dir, &banner_state_file).await?;
+        if !tasks.is_empty() {
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    Ok(())
+}
+
+async fn drain_completed_banner_tasks(
+    tasks: &mut tokio::task::JoinSet<anyhow::Result<(usize, crate::ResultV1)>>,
+    job_dir: &std::path::Path,
+    banner_state_file: &Arc<std::sync::Mutex<std::fs::File>>,
+) -> anyhow::Result<()> {
+    while let Some(result) = tasks.try_join_next() {
+        let (index, result) = result??;
+        crate::job::append_event(job_dir, &result)?;
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = banner_state_file
+            .lock()
+            .expect("banner state file mutex poisoned");
+        file.seek(SeekFrom::Start(index as u64))?;
+        file.write_all(&[crate::job::BANNER_DONE])?;
+        file.sync_data()?;
     }
     Ok(())
 }
 
 #[derive(Clone, Copy)]
 struct OpenTarget {
+    index: usize,
     ip: Ipv4Addr,
     observation: SynObservation,
 }
@@ -386,6 +494,14 @@ pub struct ScanSummary {
     pub interface_tx_packets: Option<u64>,
     #[serde(default)]
     pub interface_tx_bytes: Option<u64>,
+    #[serde(default)]
+    pub banner_queued: u64,
+    #[serde(default)]
+    pub banner_done: u64,
+    #[serde(default)]
+    pub banner_failed_or_incomplete: u64,
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 fn final_checkpoint_index(completed: bool, target_count: u64, next_index: u64) -> u64 {
@@ -406,6 +522,7 @@ mod linux {
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
+            mpsc::{self, SyncSender},
         },
         thread,
         time::Instant,
@@ -428,6 +545,8 @@ mod linux {
         conflicts: &'a mut [u8],
         sent_times: &'a [u8],
         targets: &'a [u8],
+        banner_states: Option<&'a mut [u8]>,
+        banner_sender: Option<&'a SyncSender<Option<OpenTarget>>>,
         secret: &'a [u8; 32],
         src: Ipv4Addr,
         scan: &'a crate::config::ScanConfig,
@@ -504,7 +623,9 @@ mod linux {
         };
         let flags = data[tcp + 13];
         if flags & 0x12 == 0x12 {
-            observe_response(context, index, crate::TargetState::Open);
+            if observe_response(context, index, crate::TargetState::Open) {
+                enqueue_banner(context, index);
+            }
         } else if flags & 0x04 != 0 {
             observe_response(context, index, crate::TargetState::Closed);
         }
@@ -526,19 +647,51 @@ mod linux {
         }
     }
 
-    fn observe_response(context: &mut ReplyContext<'_>, index: usize, state: crate::TargetState) {
+    fn observe_response(
+        context: &mut ReplyContext<'_>,
+        index: usize,
+        state: crate::TargetState,
+    ) -> bool {
         let current = decoded_state(context.states[index]);
         if current != crate::TargetState::NoResponse && current != state {
             increment_u32(context.conflicts, index);
         }
+        let mut upgraded = false;
         if state.rank() > current.rank() {
             context.states[index] = crate::result::encode_state_byte(state, context.syn_attempts);
+            upgraded = true;
         }
         if read_u32(context.rtts, index) == 0 {
             if let Some(rtt_us) = response_rtt_us(context.sent_times, index, context.now_ms) {
                 write_u32(context.rtts, index, rtt_us.saturating_add(1));
             }
         }
+        upgraded && state == crate::TargetState::Open && current != crate::TargetState::Open
+    }
+
+    fn enqueue_banner(context: &mut ReplyContext<'_>, index: usize) {
+        let Some(sender) = context.banner_sender else {
+            return;
+        };
+        let Some(banner_states) = context.banner_states.as_deref_mut() else {
+            return;
+        };
+        if banner_states[index] == crate::job::BANNER_DONE
+            || banner_states[index] == crate::job::BANNER_QUEUED_OR_RUNNING
+        {
+            return;
+        }
+        banner_states[index] = crate::job::BANNER_QUEUED_OR_RUNNING;
+        let target = OpenTarget {
+            index,
+            ip: target_ip(context.targets, index),
+            observation: SynObservation {
+                attempts: context.syn_attempts,
+                rtt_ms: decode_rtt_ms(context.rtts, index),
+                conflicting_observations: read_u32(context.conflicts, index),
+            },
+        };
+        let _ = sender.send(Some(target));
     }
 
     fn response_rtt_us(sent_times: &[u8], index: usize, now_ms: u32) -> Option<u32> {
@@ -632,6 +785,7 @@ mod linux {
         bucket: TokenBucket,
         tx_start: TxStats,
         mss: u16,
+        timed_out: Arc<AtomicBool>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -655,6 +809,8 @@ mod linux {
         rtts: &'a mut [u8],
         sent_times: &'a mut [u8],
         conflicts: &'a mut [u8],
+        banner_states: &'a mut [u8],
+        banner_sender: &'a SyncSender<Option<OpenTarget>>,
     }
 
     struct ScanMaps {
@@ -663,11 +819,17 @@ mod linux {
         rtts: memmap2::MmapMut,
         sent_times: memmap2::MmapMut,
         conflicts: memmap2::MmapMut,
+        banner_states: memmap2::MmapMut,
     }
 
     struct PreparedSyn {
         ip: Ipv4Addr,
         packet: Vec<u8>,
+    }
+
+    struct BannerRunner {
+        sender: SyncSender<Option<OpenTarget>>,
+        handle: thread::JoinHandle<anyhow::Result<()>>,
     }
 
     const SENDMMSG_BATCH: usize = 64;
@@ -687,6 +849,16 @@ mod linux {
             cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio;
         let stopping = Arc::new(AtomicBool::new(false));
         install_stop_handler(&stopping)?;
+        let timed_out = Arc::new(AtomicBool::new(false));
+        if let Some(max_runtime_secs) = cfg.scan.max_runtime_secs {
+            let stopping = stopping.clone();
+            let timed_out = timed_out.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(max_runtime_secs));
+                timed_out.store(true, Ordering::SeqCst);
+                stopping.store(true, Ordering::SeqCst);
+            });
+        }
         Ok(ScanRuntime {
             source_ip,
             seed,
@@ -698,6 +870,7 @@ mod linux {
             bucket: TokenBucket::new(rate, 0.1),
             tx_start,
             mss,
+            timed_out,
         })
     }
 
@@ -764,6 +937,63 @@ mod linux {
         Ok(())
     }
 
+    fn start_banner_runner(
+        job: &PreparedJob,
+        cfg: &Config,
+        runtime: &ScanRuntime,
+    ) -> anyhow::Result<BannerRunner> {
+        let (sender, receiver) = mpsc::sync_channel(cfg.scan.banner_queue_capacity);
+        let banner_state_file = Arc::new(std::sync::Mutex::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(job.dir.join("banner_state.bin"))?,
+        ));
+        let job_dir: PathBuf = job.dir.clone();
+        let source_ip = runtime.source_ip;
+        let cfg = cfg.clone();
+        let scan_id = job.meta.scan_id.clone();
+        let budget = AsyncTokenBucket::new(runtime.bucket.clone(), runtime.start);
+        let worker_state_file = banner_state_file.clone();
+        let handle = thread::spawn(move || {
+            tokio::runtime::Runtime::new()?.block_on(banner_pipeline(
+                job_dir,
+                receiver,
+                source_ip,
+                &cfg,
+                scan_id,
+                budget,
+                worker_state_file,
+            ))
+        });
+        Ok(BannerRunner { sender, handle })
+    }
+
+    fn enqueue_resume_banner_targets(buffers: &mut ScanBuffers<'_>) -> anyhow::Result<()> {
+        for index in 0..buffers.states.len() {
+            let (state, attempts) = match crate::result::decode_state_byte(buffers.states[index]) {
+                Ok(decoded) => decoded,
+                Err(_) => continue,
+            };
+            if state != crate::TargetState::Open
+                || buffers.banner_states[index] == crate::job::BANNER_DONE
+            {
+                continue;
+            }
+            buffers.banner_states[index] = crate::job::BANNER_QUEUED_OR_RUNNING;
+            buffers.banner_sender.send(Some(OpenTarget {
+                index,
+                ip: target_ip(buffers.targets, index),
+                observation: SynObservation {
+                    attempts,
+                    rtt_ms: decode_rtt_ms(buffers.rtts, index),
+                    conflicting_observations: read_u32(buffers.conflicts, index),
+                },
+            }))?;
+        }
+        Ok(())
+    }
+
     pub fn run(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> {
         let mut runtime = scan_runtime(job, cfg)?;
         let target_file = File::open(job.dir.join("targets.bin"))?;
@@ -772,6 +1002,8 @@ mod linux {
         let mut rtts = job.rtts()?;
         let mut sent_times = job.sent_times()?;
         let mut conflicts = job.conflicts()?;
+        let mut banner_states = crate::job::ensure_banner_state_backfilled(job, cfg)?;
+        let banner_runner = start_banner_runner(job, cfg, &runtime)?;
         {
             let mut buffers = ScanBuffers {
                 targets: &targets,
@@ -779,19 +1011,24 @@ mod linux {
                 rtts: &mut rtts,
                 sent_times: &mut sent_times,
                 conflicts: &mut conflicts,
+                banner_states: &mut banner_states,
+                banner_sender: &banner_runner.sender,
             };
+            enqueue_resume_banner_targets(&mut buffers)?;
             send_rounds(job, cfg, &mut runtime, &mut buffers)?;
         }
         let summary = finish_scan(
             job,
             cfg,
             &mut runtime,
+            banner_runner,
             ScanMaps {
                 targets,
                 states,
                 rtts,
                 sent_times,
                 conflicts,
+                banner_states,
             },
         )?;
         Ok(summary)
@@ -969,6 +1206,8 @@ mod linux {
             conflicts: buffers.conflicts,
             sent_times: buffers.sent_times,
             targets: buffers.targets,
+            banner_states: Some(buffers.banner_states),
+            banner_sender: Some(buffers.banner_sender),
             secret: &runtime.seed,
             src: runtime.source_ip,
             scan: &cfg.scan,
@@ -982,6 +1221,7 @@ mod linux {
         job: &mut PreparedJob,
         cfg: &Config,
         runtime: &mut ScanRuntime,
+        banner_runner: BannerRunner,
         mut maps: ScanMaps,
     ) -> anyhow::Result<ScanSummary> {
         thread::sleep(Duration::from_secs(1));
@@ -992,6 +1232,8 @@ mod linux {
                 rtts: &mut maps.rtts,
                 sent_times: &mut maps.sent_times,
                 conflicts: &mut maps.conflicts,
+                banner_states: &mut maps.banner_states,
+                banner_sender: &banner_runner.sender,
             };
             receive_replies(cfg, runtime, &mut buffers, current_attempt(job, cfg));
         }
@@ -1003,18 +1245,23 @@ mod linux {
         let next_index =
             final_checkpoint_index(completed, job.meta.target_count, job.meta.next_index);
         job.checkpoint(next_index)?;
-        let mut summary = summarize_states(completed, job, &maps.states, &maps.conflicts);
+        let mut summary = summarize_states(
+            completed,
+            job,
+            &maps.states,
+            &maps.conflicts,
+            &maps.banner_states,
+            runtime.timed_out.load(Ordering::SeqCst),
+        );
         summary.syn_mss = Some(runtime.mss);
-        let open_targets = open_targets(&maps.targets, &maps.states, &maps.rtts, &maps.conflicts);
+        let _ = banner_runner.sender.send(None);
+        banner_runner
+            .handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("banner worker thread panicked"))??;
         drop(maps);
-        tokio::runtime::Runtime::new()?.block_on(banner_pipeline(
-            &job.dir,
-            open_targets,
-            runtime.source_ip,
-            cfg,
-            &job.meta.scan_id,
-            AsyncTokenBucket::new(runtime.bucket.clone(), runtime.start),
-        ))?;
+        let banner_states = crate::job::ensure_banner_state_backfilled(job, cfg)?;
+        summary_banner_counts(&mut summary, &banner_states);
         let tx_end = interface_tx_stats(Path::new("/sys/class/net"), &cfg.network.interface)
             .context("read ending interface TX counters")?;
         let tx_delta = runtime.tx_start.delta(tx_end);
@@ -1048,11 +1295,14 @@ mod linux {
         job: &PreparedJob,
         states: &[u8],
         conflicts: &[u8],
+        banner_states: &[u8],
+        timed_out: bool,
     ) -> ScanSummary {
         let mut summary = ScanSummary {
             completed,
             sent: job.meta.packets_sent,
             pcap_drops: job.meta.pcap_drops,
+            timed_out,
             ..Default::default()
         };
         for &v in states {
@@ -1069,28 +1319,21 @@ mod linux {
         for index in 0..states.len() {
             summary.conflicting_observations += u64::from(read_u32(conflicts, index));
         }
+        summary_banner_counts(&mut summary, banner_states);
         summary
     }
 
-    fn open_targets(
-        targets: &[u8],
-        states: &[u8],
-        rtts: &[u8],
-        conflicts: &[u8],
-    ) -> Vec<OpenTarget> {
-        (0..states.len())
-            .filter_map(|i| {
-                let (state, attempts) = crate::result::decode_state_byte(states[i]).ok()?;
-                (state == crate::TargetState::Open).then_some(OpenTarget {
-                    ip: target_ip(targets, i),
-                    observation: SynObservation {
-                        attempts,
-                        rtt_ms: decode_rtt_ms(rtts, i),
-                        conflicting_observations: read_u32(conflicts, i),
-                    },
-                })
-            })
-            .collect()
+    fn summary_banner_counts(summary: &mut ScanSummary, banner_states: &[u8]) {
+        summary.banner_queued = 0;
+        summary.banner_done = 0;
+        for &state in banner_states {
+            match state {
+                crate::job::BANNER_QUEUED_OR_RUNNING => summary.banner_queued += 1,
+                crate::job::BANNER_DONE => summary.banner_done += 1,
+                _ => {}
+            }
+        }
+        summary.banner_failed_or_incomplete = summary.open.saturating_sub(summary.banner_done);
     }
 
     fn target_ip(targets: &[u8], index: usize) -> Ipv4Addr {
@@ -1116,6 +1359,8 @@ mod linux {
                 banner_attempts: 1,
                 banner_concurrency: 1,
                 banner_connects_per_second: 1,
+                banner_queue_capacity: 8,
+                max_runtime_secs: None,
             }
         }
 
@@ -1317,6 +1562,8 @@ mod linux {
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                banner_states: None,
+                banner_sender: None,
                 secret: &secret,
                 src,
                 scan: &scan,
@@ -1352,6 +1599,8 @@ mod linux {
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                banner_states: None,
+                banner_sender: None,
                 secret: &secret,
                 src,
                 scan: &scan,
@@ -1387,6 +1636,8 @@ mod linux {
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                banner_states: None,
+                banner_sender: None,
                 secret: &secret,
                 src,
                 scan: &scan,
@@ -1433,6 +1684,8 @@ mod linux {
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                banner_states: None,
+                banner_sender: None,
                 secret: &secret,
                 src,
                 scan: &scan,
@@ -1475,6 +1728,8 @@ mod linux {
                 conflicts: &mut conflicts,
                 sent_times: &sent_times,
                 targets: &targets,
+                banner_states: None,
+                banner_sender: None,
                 secret: &secret,
                 src,
                 scan: &scan,
@@ -1487,12 +1742,56 @@ mod linux {
             assert_state(states[0], crate::TargetState::Unreachable, 1);
             assert_eq!(decode_rtt_ms(&rtts, 0), Some(50.0));
         }
+
+        #[test]
+        fn resume_enqueues_open_targets_without_done_banner_state() -> anyhow::Result<()> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+            let targets = [10, 0, 0, 1, 10, 0, 0, 2];
+            let mut states = [
+                crate::result::encode_state_byte(crate::TargetState::Open, 1),
+                crate::result::encode_state_byte(crate::TargetState::Open, 2),
+            ];
+            let mut rtts = [0; 8];
+            write_u32(&mut rtts, 1, 42_001);
+            let mut sent_times = [0; 8];
+            let mut conflicts = [0; 8];
+            write_u32(&mut conflicts, 1, 3);
+            let mut banner_states = [crate::job::BANNER_DONE, crate::job::BANNER_NOT_QUEUED];
+            let mut buffers = ScanBuffers {
+                targets: &targets,
+                states: &mut states,
+                rtts: &mut rtts,
+                sent_times: &mut sent_times,
+                conflicts: &mut conflicts,
+                banner_states: &mut banner_states,
+                banner_sender: &sender,
+            };
+
+            enqueue_resume_banner_targets(&mut buffers)?;
+            let target = receiver.try_recv()?.expect("queued target");
+
+            assert_eq!(target.index, 1);
+            assert_eq!(target.ip, Ipv4Addr::new(10, 0, 0, 2));
+            assert_eq!(target.observation.attempts, 2);
+            assert_eq!(target.observation.rtt_ms, Some(42.0));
+            assert_eq!(target.observation.conflicting_observations, 3);
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(
+                buffers.banner_states[1],
+                crate::job::BANNER_QUEUED_OR_RUNNING
+            );
+            Ok(())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncTokenBucket, final_checkpoint_index};
+    use super::{AsyncTokenBucket, estimate, final_checkpoint_index};
+    use crate::config::{
+        BudgetConfig, NetworkConfig, OutputConfig, Protocol, ScanConfig, SourceIp, TargetsConfig,
+    };
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1512,5 +1811,66 @@ mod tests {
             assert!(budget.reserve(50).await >= Duration::from_millis(400));
             assert!(budget.reserve(50).await >= Duration::from_millis(900));
         });
+    }
+
+    #[test]
+    fn estimate_reports_time_budget_bottlenecks() {
+        let cfg = crate::Config {
+            scan: ScanConfig {
+                port: 22,
+                protocol: Protocol::Ssh,
+                syn_attempts: 3,
+                source_port: 61_000,
+                connect_timeout_ms: 3_000,
+                banner_timeout_ms: 5_000,
+                banner_max_bytes: 4_096,
+                banner_attempts: 2,
+                banner_concurrency: 512,
+                banner_connects_per_second: 200,
+                banner_queue_capacity: 1024,
+                max_runtime_secs: None,
+            },
+            budget: BudgetConfig {
+                time_budget_secs: Some(7_200),
+                expected_open_ratio: Some(0.50),
+            },
+            targets: TargetsConfig {
+                include: vec![PathBuf::from("unused")],
+                exclude: vec![],
+                allow_private: true,
+                max_targets: 10_000_000,
+            },
+            network: NetworkConfig {
+                interface: "lo".into(),
+                source_ip: SourceIp("127.0.0.1".into()),
+                provider_egress_mbps: 1.0,
+                application_ratio: 0.8,
+                tc_ratio: 0.85,
+                require_tc: false,
+                accounting: "estimated-wire".into(),
+            },
+            output: OutputConfig {
+                job_root: PathBuf::from("."),
+                output_all: false,
+            },
+        };
+
+        let estimate = estimate(&cfg, 10_000_000);
+
+        assert!(estimate.syn_seconds > 7_200.0);
+        assert_eq!(estimate.expected_open, Some(5_000_000.0));
+        assert!(estimate.banner_budget_capacity_open.unwrap() < 5_000_000.0);
+        assert!(
+            estimate
+                .budget_warnings
+                .iter()
+                .any(|warning| warning.contains("SYN bandwidth"))
+        );
+        assert!(
+            estimate
+                .budget_warnings
+                .iter()
+                .any(|warning| warning.contains("banner"))
+        );
     }
 }

@@ -71,9 +71,34 @@ fn main() -> anyhow::Result<()> {
             let c = Config::load(config)?;
             let e = riftmap::scanner::estimate(&c, prepare_count(&c)?);
             println!(
-                "targets: {}\nworst_packets: {}\nestimated_wire_bytes: {}\nminimum_seconds: {:.1}",
-                e.targets, e.worst_packets, e.estimated_wire_bytes, e.minimum_seconds
+                "targets: {}\nworst_packets: {}\nestimated_wire_bytes: {}\nsyn_seconds: {:.1}\nbanner_capacity_cps: {:.1}",
+                e.targets,
+                e.worst_packets,
+                e.estimated_wire_bytes,
+                e.syn_seconds,
+                e.banner_capacity_cps
             );
+            if let Some(mbps) = e.required_syn_application_mbps {
+                println!("required_syn_application_mbps: {mbps:.3}");
+            }
+            if let Some(mbps) = e.recommended_provider_egress_mbps {
+                println!("recommended_provider_egress_mbps: {mbps:.3}");
+            }
+            if let Some(open) = e.expected_open {
+                println!("expected_open_targets: {open:.0}");
+            }
+            if let Some(open) = e.banner_budget_capacity_open {
+                println!("banner_budget_capacity_open: {open:.0}");
+            }
+            if let Some(seconds) = e.banner_seconds {
+                println!("banner_seconds: {seconds:.1}");
+            }
+            if let Some(seconds) = e.estimated_total_seconds {
+                println!("estimated_total_seconds: {seconds:.1}");
+            }
+            for warning in e.budget_warnings {
+                println!("budget_warning: {warning}");
+            }
         }
         Command::TcTemplate { config } => {
             let c = Config::load(config)?;

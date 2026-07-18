@@ -29,6 +29,9 @@ pub(crate) fn d_concurrency() -> usize {
 pub(crate) fn d_cps() -> u32 {
     200
 }
+pub(crate) fn d_banner_queue_capacity() -> usize {
+    8192
+}
 pub(crate) fn d_max_targets() -> u64 {
     25_000_000
 }
@@ -79,6 +82,18 @@ pub struct ScanConfig {
     pub banner_concurrency: usize,
     #[serde(default = "d_cps")]
     pub banner_connects_per_second: u32,
+    #[serde(default = "d_banner_queue_capacity")]
+    pub banner_queue_capacity: usize,
+    #[serde(default)]
+    pub max_runtime_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    #[serde(default)]
+    pub expected_open_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +150,8 @@ pub struct OutputConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub scan: ScanConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
     pub targets: TargetsConfig,
     pub network: NetworkConfig,
     pub output: OutputConfig,
@@ -178,6 +195,21 @@ impl Config {
             self.scan.banner_max_bytes > 0 && self.scan.banner_max_bytes <= 1_048_576,
             "invalid banner_max_bytes"
         );
+        anyhow::ensure!(
+            self.scan.banner_concurrency > 0,
+            "banner_concurrency must be positive"
+        );
+        anyhow::ensure!(
+            self.scan.banner_connects_per_second > 0,
+            "banner_connects_per_second must be positive"
+        );
+        anyhow::ensure!(
+            self.scan.banner_queue_capacity > 0,
+            "banner_queue_capacity must be positive"
+        );
+        if let Some(max_runtime_secs) = self.scan.max_runtime_secs {
+            anyhow::ensure!(max_runtime_secs > 0, "max_runtime_secs must be positive");
+        }
         anyhow::ensure!(self.targets.max_targets > 0, "max_targets must be positive");
         anyhow::ensure!(
             self.network.provider_egress_mbps > 0.0,
@@ -199,6 +231,15 @@ impl Config {
             self.network.accounting == "estimated-wire",
             "only estimated-wire accounting is supported"
         );
+        if let Some(time_budget_secs) = self.budget.time_budget_secs {
+            anyhow::ensure!(time_budget_secs > 0, "time_budget_secs must be positive");
+        }
+        if let Some(expected_open_ratio) = self.budget.expected_open_ratio {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&expected_open_ratio),
+                "expected_open_ratio must be in 0..=1"
+            );
+        }
         anyhow::ensure!(
             self.network.source_ip.is_auto() || self.network.source_ip.address().is_some(),
             "source_ip must be auto or IPv4"

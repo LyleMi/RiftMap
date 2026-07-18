@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, Write},
     net::Ipv4Addr,
     path::{Path, PathBuf},
 };
@@ -33,6 +33,10 @@ pub struct PreparedJob {
     pub dir: PathBuf,
     pub meta: JobMeta,
 }
+
+pub const BANNER_NOT_QUEUED: u8 = 0;
+pub const BANNER_QUEUED_OR_RUNNING: u8 = 1;
+pub const BANNER_DONE: u8 = 2;
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -115,6 +119,7 @@ impl PreparedJob {
                 .checked_mul(4)
                 .context("conflict count file length overflow")?,
         )?;
+        create_zeroed_file(&dir.join("banner_state.bin"), count)?;
         let meta = JobMeta {
             format_version: 1,
             scan_id,
@@ -161,6 +166,10 @@ impl PreparedJob {
     pub fn conflicts(&self) -> anyhow::Result<MmapMut> {
         self.fixed_mmap("conflicts.bin", self.meta.target_count * 4)
             .context("map conflicts.bin")
+    }
+    pub fn banner_states(&self) -> anyhow::Result<MmapMut> {
+        self.fixed_mmap("banner_state.bin", self.meta.target_count)
+            .context("map banner_state.bin")
     }
     fn fixed_mmap(&self, name: &str, len: u64) -> anyhow::Result<MmapMut> {
         let path = self.dir.join(name);
@@ -232,6 +241,65 @@ pub fn append_event(dir: &Path, result: &ResultV1) -> anyhow::Result<()> {
     f.sync_data()?;
     Ok(())
 }
+
+pub fn ensure_banner_state_backfilled(job: &PreparedJob, cfg: &Config) -> anyhow::Result<MmapMut> {
+    let path = job.dir.join("banner_state.bin");
+    let existed = path.exists();
+    let mut states = job.banner_states()?;
+    if !existed {
+        backfill_banner_done_from_events(job, cfg, &mut states)?;
+        states.flush()?;
+    }
+    Ok(states)
+}
+
+pub fn backfill_banner_done_from_events(
+    job: &PreparedJob,
+    cfg: &Config,
+    banner_states: &mut [u8],
+) -> anyhow::Result<()> {
+    let input = job.dir.join("events.ndjson");
+    if !input.exists() {
+        return Ok(());
+    }
+    for (i, line) in BufReader::new(File::open(input)?).lines().enumerate() {
+        let line = line?;
+        let result: ResultV1 =
+            serde_json::from_str(&line).with_context(|| format!("event line {}", i + 1))?;
+        if result.scan_id != job.meta.scan_id || result.port != cfg.scan.port {
+            continue;
+        }
+        let index = target_index(&job.dir, job.meta.target_count, result.ip)?;
+        banner_states[index] = BANNER_DONE;
+    }
+    Ok(())
+}
+
+fn target_index(dir: &Path, target_count: u64, ip: Ipv4Addr) -> anyhow::Result<usize> {
+    let mut file = File::open(dir.join("targets.bin"))?;
+    let needle = u32::from(ip).to_be_bytes();
+    let mut lo = 0u64;
+    let mut hi = target_count;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(mid * 4))?;
+        let mut value = [0; 4];
+        file.read_exact(&mut value)?;
+        if value < needle {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    anyhow::ensure!(lo < target_count, "event target not found in job targets");
+    file.seek(std::io::SeekFrom::Start(lo * 4))?;
+    let mut value = [0; 4];
+    file.read_exact(&mut value)?;
+    anyhow::ensure!(value == needle, "event target not found in job targets");
+    Ok(lo as usize)
+}
+
 pub fn export(dir: &Path, output_all: bool) -> anyhow::Result<usize> {
     let input = dir.join("events.ndjson");
     let mut by_id: BTreeMap<String, ResultV1> = BTreeMap::new();
@@ -365,7 +433,10 @@ mod tests {
                 banner_attempts: 2,
                 banner_concurrency: 8,
                 banner_connects_per_second: 10,
+                banner_queue_capacity: 128,
+                max_runtime_secs: None,
             },
+            budget: Default::default(),
             targets: TargetsConfig {
                 include: vec![include],
                 exclude: vec![],
@@ -498,6 +569,46 @@ mod tests {
     }
 
     #[test]
+    fn missing_banner_state_is_backfilled_from_events() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let include = temp.path().join("targets.txt");
+        fs::write(&include, "10.0.0.1\n10.0.0.2\n")?;
+        let cfg = config(temp.path(), include, false);
+        let job = PreparedJob::create(&cfg, Some([5; 32]))?;
+        let ip = "10.0.0.2".parse()?;
+        append_event(
+            &job.dir,
+            &ResultV1 {
+                schema_version: crate::SCHEMA_VERSION,
+                result_id: crate::result::result_id(&job.meta.scan_id, ip, cfg.scan.port),
+                scan_id: job.meta.scan_id.clone(),
+                ip,
+                port: cfg.scan.port,
+                protocol: cfg.scan.protocol,
+                state: TargetState::Open,
+                syn_attempts: 1,
+                rtt_ms: Some(1.0),
+                conflicting_observations: 0,
+                first_observed_at: None,
+                last_observed_at: None,
+                banner_status: Some(crate::BannerStatus::Ok),
+                banner_base64: None,
+                banner_text: None,
+                ssh: None,
+                ftp: None,
+                mysql: None,
+            },
+        )?;
+        fs::remove_file(job.dir.join("banner_state.bin"))?;
+
+        let states = ensure_banner_state_backfilled(&job, &cfg)?;
+
+        assert_eq!(states[0], BANNER_NOT_QUEUED);
+        assert_eq!(states[1], BANNER_DONE);
+        Ok(())
+    }
+
+    #[test]
     fn summary_round_trips_atomically() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let summary = crate::scanner::ScanSummary {
@@ -512,6 +623,10 @@ mod tests {
             conflicting_observations: 2,
             interface_tx_packets: Some(11),
             interface_tx_bytes: Some(990),
+            banner_queued: 1,
+            banner_done: 1,
+            banner_failed_or_incomplete: 0,
+            timed_out: false,
         };
 
         save_summary(temp.path(), &summary)?;
