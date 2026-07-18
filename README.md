@@ -45,12 +45,15 @@ automatically; explicitly listed single IPs are preserved. Excludes always win.
 For a step-by-step runbook, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ```sh
+riftmap validate-config -c config.local.toml
 riftmap estimate -c config.local.toml
 riftmap tc-template -c config.local.toml
 # Review and apply the printed tc command yourself.
 riftmap doctor -c config.local.toml
 riftmap scan -c config.local.toml --dry-run
 riftmap scan -c config.local.toml
+riftmap job list -c config.local.toml
+riftmap job status --job .riftmap/jobs/<scan-id>
 riftmap resume --job .riftmap/jobs/<scan-id>
 riftmap export --job .riftmap/jobs/<scan-id>
 ```

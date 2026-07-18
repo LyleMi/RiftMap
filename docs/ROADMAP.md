@@ -14,10 +14,10 @@ MVP. It is not a release commitment.
 
 ## Operator experience
 
-- Add a `job status` command that reads `checkpoint.json` and `summary.json`.
-- Add a `job list` command for the configured job root.
-- Add `validate-config` or extend `doctor` with target-count and path checks
-  that do not require raw-network privileges.
+- Completed: `job status` reads `checkpoint.json` and optional `summary.json`.
+- Completed: `job list` summarizes the configured job root.
+- Completed: `validate-config` performs target-count and path checks without
+  raw-network privileges.
 - Add export filters such as state, protocol, and banner status.
 - Add CSV output for simple inventory ingestion.
 

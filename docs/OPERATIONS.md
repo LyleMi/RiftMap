@@ -24,12 +24,14 @@ cp config.example.toml config.local.toml
 $EDITOR config.local.toml
 
 cargo build --release
+target/release/riftmap validate-config -c config.local.toml
 target/release/riftmap estimate -c config.local.toml
 target/release/riftmap tc-template -c config.local.toml
 # Review and apply the printed tc command yourself.
 sudo target/release/riftmap doctor -c config.local.toml
 sudo target/release/riftmap scan -c config.local.toml --dry-run
 sudo target/release/riftmap scan -c config.local.toml
+target/release/riftmap job status --job .riftmap/jobs/<scan-id>
 target/release/riftmap export --job .riftmap/jobs/<scan-id>
 ```
 
@@ -41,6 +43,48 @@ sudo target/release/riftmap resume --job .riftmap/jobs/<scan-id>
 
 The job stores an immutable `config.toml`, so resume and export use the
 configuration captured when the job was created.
+
+## Offline checks
+
+Use `validate-config` before any privileged preflight or live scan:
+
+```sh
+target/release/riftmap validate-config -c config.local.toml
+```
+
+This command loads TOML, resolves target and job-root paths relative to the
+config file, parses include and exclude files, applies the private/reserved
+address policy, verifies the filtered target count is non-zero and within
+`targets.max_targets`, and prints the same key estimate fields as `estimate`.
+It does not open pcap, check root or capabilities, inspect qdisc, or call `tc`.
+
+To discover jobs under the configured `output.job_root`:
+
+```sh
+target/release/riftmap job list -c config.local.toml
+```
+
+Each job is one tab-separated line:
+
+```text
+scan_id  status  targets  round  next_index  completed  degraded  updated_at  path
+```
+
+`updated_at` is the `checkpoint.json` modification time as Unix seconds, or
+`unknown` if unavailable. A missing job root prints no rows and exits
+successfully. A malformed job prints `invalid` for its status without failing
+the whole list.
+
+To inspect one job without raw-network privileges:
+
+```sh
+target/release/riftmap job status --job .riftmap/jobs/<scan-id>
+```
+
+`job status` reads `checkpoint.json`, the immutable job `config.toml`, and
+`summary.json` when present. If `summary.json` is missing, it prints
+`summary: missing`, falls back to state files for counters, and suggests
+`next_action: inspect_missing_summary`.
 
 ## Rate controls
 

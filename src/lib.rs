@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod job;
+pub mod ops;
 pub mod packet;
 pub mod permutation;
 pub mod protocol;

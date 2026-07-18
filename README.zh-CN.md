@@ -26,12 +26,15 @@ sudo apt-get install build-essential pkg-config libpcap-dev iproute2
 cargo build --release
 cp config.example.toml config.local.toml
 
+riftmap validate-config -c config.local.toml
 riftmap estimate -c config.local.toml
 riftmap tc-template -c config.local.toml
 # 审核并自行执行输出的 tc 命令
 riftmap doctor -c config.local.toml
 riftmap scan -c config.local.toml --dry-run
 riftmap scan -c config.local.toml
+riftmap job list -c config.local.toml
+riftmap job status --job .riftmap/jobs/<scan-id>
 riftmap resume --job .riftmap/jobs/<scan-id>
 riftmap export --job .riftmap/jobs/<scan-id>
 ```
