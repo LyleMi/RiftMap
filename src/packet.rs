@@ -43,11 +43,14 @@ pub struct SynPacket {
     pub dest_port: u16,
     pub seq: u32,
     pub mss: u16,
+    pub ttl: u8,
+    pub window_size: u16,
+    pub window_scale: u8,
 }
 
 impl SynPacket {
     pub fn encode(&self) -> Vec<u8> {
-        // MSS, SACK permitted, NOP, window scale 8; padded to a 32-byte TCP header.
+        // MSS, SACK permitted, NOP, window scale; padded to a 32-byte TCP header.
         let options = [
             2,
             4,
@@ -58,7 +61,7 @@ impl SynPacket {
             1,
             3,
             3,
-            8,
+            self.window_scale,
             1,
             1,
         ];
@@ -67,7 +70,7 @@ impl SynPacket {
         p[0] = 0x45;
         p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
         p[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-        p[8] = 64;
+        p[8] = self.ttl;
         p[9] = 6;
         p[12..16].copy_from_slice(&self.src.octets());
         p[16..20].copy_from_slice(&self.dst.octets());
@@ -79,7 +82,7 @@ impl SynPacket {
         p[t + 4..t + 8].copy_from_slice(&self.seq.to_be_bytes());
         p[t + 12] = (((20 + options.len()) / 4) as u8) << 4;
         p[t + 13] = 0x02;
-        p[t + 14..t + 16].copy_from_slice(&64240u16.to_be_bytes());
+        p[t + 14..t + 16].copy_from_slice(&self.window_size.to_be_bytes());
         p[t + 20..].copy_from_slice(&options);
         let mut pseudo = Vec::with_capacity(12 + total - 20);
         pseudo.extend_from_slice(&self.src.octets());
@@ -105,8 +108,14 @@ mod tests {
             dest_port: 22,
             seq: 7,
             mss: 1460,
+            ttl: 64,
+            window_size: 64240,
+            window_scale: 7,
         }
         .encode();
+        assert_eq!(p[8], 64);
+        assert_eq!(u16::from_be_bytes(p[34..36].try_into().unwrap()), 64240);
+        assert_eq!(p[49], 7);
         assert_eq!(checksum(&p[..20]), 0);
         let mut ps = Vec::new();
         ps.extend_from_slice(&p[12..20]);

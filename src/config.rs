@@ -11,6 +11,15 @@ pub(crate) fn d_syn_attempts() -> u8 {
 pub(crate) fn d_source_port() -> u16 {
     61000
 }
+pub(crate) fn d_syn_ttl() -> u8 {
+    64
+}
+pub(crate) fn d_syn_window_size() -> u16 {
+    64240
+}
+pub(crate) fn d_syn_window_scale() -> u8 {
+    7
+}
 pub(crate) fn d_connect_timeout() -> u64 {
     3000
 }
@@ -128,6 +137,12 @@ pub struct ScanConfig {
     pub syn_attempts: u8,
     #[serde(default = "d_source_port")]
     pub source_port: u16,
+    #[serde(default = "d_syn_ttl")]
+    pub syn_ttl: u8,
+    #[serde(default = "d_syn_window_size")]
+    pub syn_window_size: u16,
+    #[serde(default = "d_syn_window_scale")]
+    pub syn_window_scale: u8,
     #[serde(default = "d_connect_timeout")]
     pub connect_timeout_ms: u64,
     #[serde(default = "d_banner_timeout")]
@@ -307,6 +322,15 @@ impl Config {
     }
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.scan.source_port != 0, "source_port must be non-zero");
+        anyhow::ensure!(self.scan.syn_ttl != 0, "syn_ttl must be non-zero");
+        anyhow::ensure!(
+            self.scan.syn_window_size != 0,
+            "syn_window_size must be non-zero"
+        );
+        anyhow::ensure!(
+            self.scan.syn_window_scale <= 14,
+            "syn_window_scale must be <= 14"
+        );
         let services = self.scan.services();
         anyhow::ensure!(
             !services.is_empty(),
@@ -435,6 +459,9 @@ mod tests {
                 services: vec![],
                 syn_attempts: 3,
                 source_port: 61_000,
+                syn_ttl: d_syn_ttl(),
+                syn_window_size: d_syn_window_size(),
+                syn_window_scale: d_syn_window_scale(),
                 connect_timeout_ms: 3_000,
                 banner_timeout_ms: 5_000,
                 banner_max_bytes: 4_096,

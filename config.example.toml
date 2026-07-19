@@ -10,7 +10,12 @@ protocol = "ssh"
 #   { port = 3306, protocol = "mysql" },
 # ]
 syn_attempts = 3
+# Raw SYN probe fingerprint. Defaults mirror common Linux/OpenSSH client
+# connections on Ethernet-sized paths.
 source_port = 61000
+syn_ttl = 64
+syn_window_size = 64240
+syn_window_scale = 7
 connect_timeout_ms = 3000
 banner_timeout_ms = 5000
 banner_max_bytes = 4096
