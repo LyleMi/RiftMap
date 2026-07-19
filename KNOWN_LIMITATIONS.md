@@ -6,9 +6,10 @@ is implemented, but production use still needs broader native-Linux proof:
 - The Linux backend has unit coverage and a namespace-isolated CI smoke test,
   but tc accuracy, loss curves, and 20-million-target RSS still require broader
   native-Linux validation.
-- Each job supports one IPv4 TCP port and one passive banner protocol.
-- Distributed sharding is not implemented. Job metadata contains shard fields,
-  but job creation currently fixes them to a single shard.
+- Each job supports one or more IPv4 TCP service endpoints, but every endpoint
+  still uses passive, server-first banner collection.
+- Shards are created and run explicitly. Cross-host scheduling, coordination,
+  and result merging are not implemented.
 - IPv6, UDP, TLS handshakes, authentication, active probes, and vulnerability
   detection are outside the current safety and traffic model.
 
