@@ -163,8 +163,9 @@ Full export is refused when:
 
 ## Troubleshooting
 
-- `source port ... unavailable`: another local process is bound to
-  `scan.source_port`; change the source port or stop that process.
+- `source port ... unavailable`: another local process is bound to a non-zero
+  fixed `scan.source_port`; use `source_port = 0`, change the fixed port, or
+  stop that process.
 - `root or CAP_NET_RAW/CAP_NET_ADMIN is required`: run as root or grant both
   capabilities to the binary.
 - `root qdisc is not tbf`: run `tc-template`, review the output, and apply the

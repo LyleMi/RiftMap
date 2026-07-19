@@ -341,13 +341,17 @@ pub fn doctor(cfg: &Config) -> anyhow::Result<Vec<String>> {
         format!("source IPv4: {}", resolve_source_ip(cfg)?),
         format!("interface: {}", cfg.network.interface),
     ];
-    let listener = std::net::TcpListener::bind(SocketAddrV4::new(
-        Ipv4Addr::UNSPECIFIED,
-        cfg.scan.source_port,
-    ))
-    .map_err(|e| anyhow::anyhow!("source port {} unavailable: {e}", cfg.scan.source_port))?;
-    drop(listener);
-    checks.push(format!("source port {}: available", cfg.scan.source_port));
+    if cfg.scan.source_port == 0 {
+        checks.push("source port: automatic Linux ephemeral range".into());
+    } else {
+        let listener = std::net::TcpListener::bind(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            cfg.scan.source_port,
+        ))
+        .map_err(|e| anyhow::anyhow!("source port {} unavailable: {e}", cfg.scan.source_port))?;
+        drop(listener);
+        checks.push(format!("source port {}: available", cfg.scan.source_port));
+    }
     #[cfg(target_os = "linux")]
     {
         let privileged = unsafe { libc::geteuid() } == 0 || linux_capabilities_ok()?;
@@ -1439,6 +1443,20 @@ mod linux {
         now_ms: u32,
     }
 
+    fn local_source_port(
+        configured: u16,
+        secret: &[u8; 32],
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        dest_port: u16,
+    ) -> u16 {
+        if configured == 0 {
+            packet::ephemeral_source_port(secret, src, dst, dest_port)
+        } else {
+            configured
+        }
+    }
+
     fn receive(cap: &mut pcap::Capture<pcap::Active>, context: &mut ReplyContext<'_>) {
         while let Ok(pkt) = cap.next_packet() {
             let Some((offset, ihl, protocol)) = ipv4_header(pkt.data) else {
@@ -1490,19 +1508,26 @@ mod linux {
         let source_port = u16::from_be_bytes([data[tcp], data[tcp + 1]]);
         let dest_port = u16::from_be_bytes([data[tcp + 2], data[tcp + 3]]);
         let ack = u32::from_be_bytes(data[tcp + 8..tcp + 12].try_into().unwrap());
+        let Some(index) = find_index(context.targets, context.ports, remote, source_port) else {
+            return;
+        };
+        let expected_source_port = local_source_port(
+            context.source_port,
+            context.secret,
+            context.src,
+            remote,
+            source_port,
+        );
         let cookie = packet::syn_cookie(
             context.secret,
             context.src,
             remote,
-            context.source_port,
+            expected_source_port,
             source_port,
         );
-        if dest_port != context.source_port || !packet::valid_ack(cookie, ack) {
+        if dest_port != expected_source_port || !packet::valid_ack(cookie, ack) {
             return;
         }
-        let Some(index) = find_index(context.targets, context.ports, remote, source_port) else {
-            return;
-        };
         let flags = data[tcp + 13];
         if flags & 0x12 == 0x12 {
             if observe_response(context, index, crate::TargetState::Open) {
@@ -1641,15 +1666,22 @@ mod linux {
     }
 
     fn valid_inner_reply(reply: &InnerTcpReply, context: &ReplyContext<'_>) -> bool {
+        let expected_source_port = local_source_port(
+            context.source_port,
+            context.secret,
+            context.src,
+            reply.remote,
+            reply.dest_port,
+        );
         let cookie = packet::syn_cookie(
             context.secret,
             context.src,
             reply.remote,
-            reply.source_port,
+            expected_source_port,
             reply.dest_port,
         );
         reply.source_ip == context.src
-            && reply.source_port == context.source_port
+            && reply.source_port == expected_source_port
             && reply.sequence == cookie
     }
 
@@ -1672,6 +1704,7 @@ mod linux {
         limiter: SharedBandwidthLimiter,
         tx_start: TxStats,
         mss: u16,
+        timestamp_base: u32,
         timed_out: Arc<AtomicBool>,
     }
 
@@ -1741,6 +1774,7 @@ mod linux {
         install_stop_handler(&stopping)?;
         let start = Instant::now();
         let limiter = SharedBandwidthLimiter::new(cfg, start);
+        let timestamp_base = rand::random();
         let timed_out = Arc::new(AtomicBool::new(false));
         if let Some(max_runtime_secs) = effective_runtime_limit_secs(cfg) {
             let stopping = stopping.clone();
@@ -1762,6 +1796,7 @@ mod linux {
             limiter,
             tx_start,
             mss,
+            timestamp_base,
             timed_out,
         })
     }
@@ -1779,14 +1814,26 @@ mod linux {
             .immediate_mode(true)
             .timeout(1)
             .open()?;
-        cap.filter(
-            &format!(
-                "(tcp src port {} and dst port {}) or icmp",
-                cfg.scan.port, cfg.scan.source_port
-            ),
-            true,
-        )?;
+        cap.filter(&capture_filter(cfg), true)?;
         Ok(cap.setnonblock()?)
+    }
+
+    fn capture_filter(cfg: &Config) -> String {
+        let services = cfg.scan.services();
+        let tcp_ports = services
+            .iter()
+            .map(|service| format!("src port {}", service.port))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        let tcp = if cfg.scan.source_port == 0 {
+            format!("tcp and ({tcp_ports})")
+        } else {
+            format!(
+                "tcp and ({tcp_ports}) and dst port {}",
+                cfg.scan.source_port
+            )
+        };
+        format!("({tcp}) or icmp")
     }
 
     fn interface_tx_stats(root: &Path, interface: &str) -> anyhow::Result<TxStats> {
@@ -1999,6 +2046,13 @@ mod linux {
             }
             let ip = target_ip(buffers.targets, idx);
             let service = target_service(buffers.ports, buffers.protocols, idx);
+            let source_port = local_source_port(
+                cfg.scan.source_port,
+                &runtime.seed,
+                runtime.source_ip,
+                ip,
+                service.port,
+            );
             if !runtime
                 .limiter
                 .consume_interruptible(packet::SYN_WIRE_BYTES, &runtime.stopping)
@@ -2011,7 +2065,7 @@ mod linux {
                 &runtime.seed,
                 runtime.source_ip,
                 ip,
-                cfg.scan.source_port,
+                source_port,
                 service.port,
             );
             batch.push(PreparedSyn {
@@ -2020,13 +2074,16 @@ mod linux {
                 packet: packet::SynPacket {
                     src: runtime.source_ip,
                     dst: ip,
-                    source_port: cfg.scan.source_port,
+                    source_port,
                     dest_port: service.port,
                     seq,
                     mss: runtime.mss,
                     ttl: cfg.scan.syn_ttl,
                     window_size: cfg.scan.syn_window_size,
                     window_scale: cfg.scan.syn_window_scale,
+                    timestamp_value: runtime
+                        .timestamp_base
+                        .wrapping_add(elapsed_ms(runtime.start)),
                 }
                 .encode(),
             });
@@ -2285,7 +2342,10 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::config::{Protocol, ScanConfig};
+        use crate::config::{
+            BudgetConfig, NetworkConfig, OutputConfig, Protocol, ScanConfig, SimulationConfig,
+            SourceIp, TargetsConfig,
+        };
 
         fn scan_config() -> ScanConfig {
             ScanConfig {
@@ -2431,6 +2491,51 @@ mod linux {
         }
 
         #[test]
+        fn capture_filter_includes_all_service_ports_for_auto_source_port() {
+            let mut cfg = Config {
+                scan: scan_config(),
+                budget: BudgetConfig::default(),
+                targets: TargetsConfig {
+                    include: vec!["fixtures/targets.example.txt".into()],
+                    exclude: vec![],
+                    allow_private: false,
+                    max_targets: 10,
+                },
+                network: NetworkConfig {
+                    interface: "eth0".into(),
+                    source_ip: SourceIp("192.0.2.10".into()),
+                    provider_egress_mbps: 100.0,
+                    application_ratio: 0.8,
+                    dynamic_application_mbps_file: None,
+                    tc_ratio: 0.85,
+                    require_tc: false,
+                    accounting: "estimated-wire".into(),
+                },
+                output: OutputConfig {
+                    job_root: ".riftmap/jobs".into(),
+                    output_all: false,
+                },
+                simulation: SimulationConfig::default(),
+            };
+            cfg.scan.source_port = 0;
+            cfg.scan.services = vec![
+                crate::config::ServiceConfig {
+                    port: 22,
+                    protocol: crate::Protocol::Ssh,
+                },
+                crate::config::ServiceConfig {
+                    port: 25,
+                    protocol: crate::Protocol::Smtp,
+                },
+            ];
+
+            assert_eq!(
+                capture_filter(&cfg),
+                "(tcp and (src port 22 or src port 25)) or icmp"
+            );
+        }
+
+        #[test]
         fn ipv4_header_accepts_raw_ipv4() {
             let packet = ipv4_packet(6, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, &[0; 20]);
 
@@ -2493,6 +2598,49 @@ mod linux {
             let scan = scan_config();
             let cookie = packet::syn_cookie(&secret, src, remote, scan.source_port, scan.port);
             let tcp = tcp_segment(scan.port, scan.source_port, 0, cookie.wrapping_add(1), 0x12);
+            let packet = ethernet_ipv4(ipv4_packet(6, remote, src, &tcp));
+            let (offset, ihl, _) = ipv4_header(&packet).unwrap();
+            let mut states = [0];
+            let mut rtts = [0; 4];
+            let mut conflicts = [0; 4];
+            let mut sent_times = [0; 4];
+            write_u32(&mut sent_times, 0, 90);
+            let targets = remote.octets();
+            let ports = scan.port.to_be_bytes();
+            let protocols = [crate::job::protocol_code(scan.protocol)];
+            let mut context = ReplyContext {
+                states: &mut states,
+                rtts: &mut rtts,
+                conflicts: &mut conflicts,
+                sent_times: &sent_times,
+                targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
+                banner_states: None,
+                banner_sender: None,
+                secret: &secret,
+                src,
+                source_port: scan.source_port,
+                syn_attempts: 1,
+                now_ms: 100,
+            };
+
+            handle_tcp_reply(&packet, offset, ihl, &mut context);
+
+            assert_state(states[0], crate::TargetState::Open, 1);
+            assert_eq!(decode_rtt_ms(&rtts, 0), Some(10.0));
+        }
+
+        #[test]
+        fn auto_source_port_syn_ack_marks_target_open() {
+            let src = Ipv4Addr::new(192, 0, 2, 10);
+            let remote = Ipv4Addr::new(198, 51, 100, 20);
+            let secret = [7; 32];
+            let mut scan = scan_config();
+            scan.source_port = 0;
+            let source_port = local_source_port(scan.source_port, &secret, src, remote, scan.port);
+            let cookie = packet::syn_cookie(&secret, src, remote, source_port, scan.port);
+            let tcp = tcp_segment(scan.port, source_port, 0, cookie.wrapping_add(1), 0x12);
             let packet = ethernet_ipv4(ipv4_packet(6, remote, src, &tcp));
             let (offset, ihl, _) = ipv4_header(&packet).unwrap();
             let mut states = [0];

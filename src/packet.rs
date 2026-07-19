@@ -1,7 +1,10 @@
 use std::net::Ipv4Addr;
 
-// 52-byte IPv4/TCP SYN (including options) plus Ethernet/FCS/preamble/IFG.
-pub const SYN_WIRE_BYTES: u64 = 90;
+// 60-byte IPv4/TCP SYN (including Linux-style options) plus Ethernet/FCS/preamble/IFG.
+pub const SYN_WIRE_BYTES: u64 = 98;
+
+const LINUX_EPHEMERAL_FIRST: u16 = 32768;
+const LINUX_EPHEMERAL_LAST: u16 = 60999;
 
 pub fn syn_cookie(
     secret: &[u8; 32],
@@ -19,6 +22,22 @@ pub fn syn_cookie(
 }
 pub fn valid_ack(cookie: u32, ack: u32) -> bool {
     ack == cookie.wrapping_add(1)
+}
+
+pub fn ephemeral_source_port(
+    secret: &[u8; 32],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    dest_port: u16,
+) -> u16 {
+    let mut h = blake3::Hasher::new_keyed(secret);
+    h.update(b"source-port");
+    h.update(&src.octets());
+    h.update(&dst.octets());
+    h.update(&dest_port.to_be_bytes());
+    let sample = u16::from_be_bytes(h.finalize().as_bytes()[..2].try_into().unwrap());
+    let span = LINUX_EPHEMERAL_LAST - LINUX_EPHEMERAL_FIRST + 1;
+    LINUX_EPHEMERAL_FIRST + (sample % span)
 }
 
 pub fn checksum(data: &[u8]) -> u16 {
@@ -46,11 +65,12 @@ pub struct SynPacket {
     pub ttl: u8,
     pub window_size: u16,
     pub window_scale: u8,
+    pub timestamp_value: u32,
 }
 
 impl SynPacket {
     pub fn encode(&self) -> Vec<u8> {
-        // MSS, SACK permitted, NOP, window scale; padded to a 32-byte TCP header.
+        // Linux-style SYN options: MSS, SACK permitted, timestamp, NOP, window scale.
         let options = [
             2,
             4,
@@ -58,12 +78,20 @@ impl SynPacket {
             self.mss as u8,
             4,
             2,
+            8,
+            10,
+            (self.timestamp_value >> 24) as u8,
+            (self.timestamp_value >> 16) as u8,
+            (self.timestamp_value >> 8) as u8,
+            self.timestamp_value as u8,
+            0,
+            0,
+            0,
+            0,
             1,
             3,
             3,
             self.window_scale,
-            1,
-            1,
         ];
         let total = 20 + 20 + options.len();
         let mut p = vec![0u8; total];
@@ -111,11 +139,16 @@ mod tests {
             ttl: 64,
             window_size: 64240,
             window_scale: 7,
+            timestamp_value: 1234,
         }
         .encode();
+        assert_eq!(p.len(), 60);
         assert_eq!(p[8], 64);
         assert_eq!(u16::from_be_bytes(p[34..36].try_into().unwrap()), 64240);
-        assert_eq!(p[49], 7);
+        assert_eq!(p[56], 1);
+        assert_eq!(p[57], 3);
+        assert_eq!(p[58], 3);
+        assert_eq!(p[59], 7);
         assert_eq!(checksum(&p[..20]), 0);
         let mut ps = Vec::new();
         ps.extend_from_slice(&p[12..20]);
@@ -123,6 +156,18 @@ mod tests {
         ps.extend_from_slice(&((p.len() - 20) as u16).to_be_bytes());
         ps.extend_from_slice(&p[20..]);
         assert_eq!(checksum(&ps), 0);
+    }
+
+    #[test]
+    fn ephemeral_source_port_uses_linux_default_range() {
+        let secret = [3; 32];
+        let src = "192.0.2.1".parse().unwrap();
+        let dst = "198.51.100.2".parse().unwrap();
+
+        let port = ephemeral_source_port(&secret, src, dst, 22);
+
+        assert!((32768..=60999).contains(&port));
+        assert_eq!(port, ephemeral_source_port(&secret, src, dst, 22));
     }
     #[test]
     fn ack_wraps() {

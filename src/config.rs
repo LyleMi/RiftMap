@@ -9,7 +9,7 @@ pub(crate) fn d_syn_attempts() -> u8 {
     3
 }
 pub(crate) fn d_source_port() -> u16 {
-    61000
+    0
 }
 pub(crate) fn d_syn_ttl() -> u8 {
     64
@@ -321,7 +321,6 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.scan.source_port != 0, "source_port must be non-zero");
         anyhow::ensure!(self.scan.syn_ttl != 0, "syn_ttl must be non-zero");
         anyhow::ensure!(
             self.scan.syn_window_size != 0,

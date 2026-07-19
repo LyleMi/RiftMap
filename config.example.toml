@@ -10,9 +10,10 @@ protocol = "ssh"
 #   { port = 3306, protocol = "mysql" },
 # ]
 syn_attempts = 3
-# Raw SYN probe fingerprint. Defaults mirror common Linux/OpenSSH client
-# connections on Ethernet-sized paths.
-source_port = 61000
+# Raw SYN probe shape. source_port = 0 chooses a stable per-target port from
+# Linux's default ephemeral range; set a non-zero value only for legacy fixed
+# port behavior.
+source_port = 0
 syn_ttl = 64
 syn_window_size = 64240
 syn_window_scale = 7
