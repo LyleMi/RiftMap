@@ -2,6 +2,7 @@
 //! preparation, parsing and export are portable and intentionally testable.
 
 pub mod config;
+pub mod distributed;
 pub mod job;
 pub mod ops;
 pub mod packet;

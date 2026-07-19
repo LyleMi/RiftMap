@@ -113,11 +113,12 @@ pub struct ResultV1 {
     pub postgres: Option<PostgresFields>,
 }
 
-pub fn result_id(scan_id: &str, ip: std::net::Ipv4Addr, port: u16) -> String {
+pub fn result_id(scan_id: &str, ip: std::net::Ipv4Addr, port: u16, protocol: Protocol) -> String {
     let mut h = blake3::Hasher::new();
     h.update(scan_id.as_bytes());
     h.update(&ip.octets());
     h.update(&port.to_be_bytes());
+    h.update(&[crate::job::protocol_code(protocol)]);
     h.finalize().to_hex().to_string()
 }
 
@@ -175,5 +176,15 @@ mod tests {
 
         assert_eq!(result.conflicting_observations, 0);
         Ok(())
+    }
+
+    #[test]
+    fn result_id_includes_protocol() {
+        let ip = "10.0.0.1".parse().unwrap();
+
+        assert_ne!(
+            result_id("scan", ip, 22, Protocol::Ssh),
+            result_id("scan", ip, 22, Protocol::Ftp)
+        );
     }
 }

@@ -987,7 +987,12 @@ job_root = "jobs"
             &job.dir,
             &crate::ResultV1 {
                 schema_version: crate::SCHEMA_VERSION,
-                result_id: crate::result::result_id(&job.meta.scan_id, ip, cfg.scan.port),
+                result_id: crate::result::result_id(
+                    &job.meta.scan_id,
+                    ip,
+                    cfg.scan.port,
+                    cfg.scan.protocol,
+                ),
                 scan_id: job.meta.scan_id.clone(),
                 ip,
                 port: cfg.scan.port,

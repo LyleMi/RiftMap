@@ -816,7 +816,7 @@ fn make_result(
     let parsed = observation.parsed.unwrap_or_default();
     crate::ResultV1 {
         schema_version: crate::SCHEMA_VERSION,
-        result_id: crate::result::result_id(scan_id, ip, service.port),
+        result_id: crate::result::result_id(scan_id, ip, service.port, service.protocol),
         scan_id: scan_id.into(),
         ip,
         port: service.port,
