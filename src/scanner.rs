@@ -3,9 +3,10 @@ use base64::Engine;
 use std::{
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 #[cfg(target_os = "linux")]
-use std::{path::Path, process::Command, sync::Arc, time::Duration};
+use std::{path::Path, process::Command, sync::Arc};
 
 pub fn resolve_source_ip(cfg: &Config) -> anyhow::Result<Ipv4Addr> {
     if let Some(ip) = cfg.network.source_ip.address() {
@@ -108,6 +109,209 @@ pub struct Estimate {
     pub banner_seconds: Option<f64>,
     pub estimated_total_seconds: Option<f64>,
     pub budget_warnings: Vec<String>,
+}
+
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+struct ProgressReporter {
+    total: u64,
+    start_done: u64,
+    started: Instant,
+    last_printed: Option<Instant>,
+}
+
+impl ProgressReporter {
+    fn new(job: &PreparedJob, syn_attempts: u8) -> Self {
+        let total = total_progress_units(job.meta.target_count, syn_attempts);
+        Self {
+            total,
+            start_done: progress_units(
+                job.meta.target_count,
+                syn_attempts,
+                job.meta.round,
+                job.meta.next_index,
+            ),
+            started: Instant::now(),
+            last_printed: None,
+        }
+    }
+
+    fn maybe_print(&mut self, job: &PreparedJob, syn_attempts: u8, next_index: u64) {
+        let now = Instant::now();
+        if self
+            .last_printed
+            .is_none_or(|last| now.duration_since(last) >= PROGRESS_INTERVAL)
+        {
+            self.print(job, syn_attempts, next_index, now);
+        }
+    }
+
+    fn print_final(&mut self, job: &PreparedJob, syn_attempts: u8, next_index: u64) {
+        self.print(job, syn_attempts, next_index, Instant::now());
+    }
+
+    fn print(&mut self, job: &PreparedJob, syn_attempts: u8, next_index: u64, now: Instant) {
+        let done = progress_units(
+            job.meta.target_count,
+            syn_attempts,
+            job.meta.round,
+            next_index,
+        );
+        let pct = progress_percent(done, self.total);
+        let elapsed = now.duration_since(self.started);
+        let run_done = done.saturating_sub(self.start_done);
+        let rate = rate_per_second(run_done, elapsed);
+        let eta = eta(run_done, done, self.total, elapsed);
+        let current_round = current_progress_round(job.meta.round, syn_attempts, done, self.total);
+        eprintln!(
+            "progress: {}/{} probes ({pct:.2}%) round {}/{}, sent {}, rate {}, elapsed {}, eta {}",
+            human_count(done),
+            human_count(self.total),
+            current_round,
+            syn_attempts,
+            human_count(job.meta.packets_sent),
+            human_rate(rate),
+            human_duration(elapsed),
+            eta.map(human_duration)
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+        self.last_printed = Some(now);
+    }
+}
+
+fn total_progress_units(target_count: u64, syn_attempts: u8) -> u64 {
+    target_count.saturating_mul(u64::from(syn_attempts))
+}
+
+fn progress_units(target_count: u64, syn_attempts: u8, round: u8, next_index: u64) -> u64 {
+    let total = total_progress_units(target_count, syn_attempts);
+    let rounds_done = u64::from(round).min(u64::from(syn_attempts));
+    rounds_done
+        .saturating_mul(target_count)
+        .saturating_add(next_index.min(target_count))
+        .min(total)
+}
+
+fn progress_percent(done: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        done as f64 * 100.0 / total as f64
+    }
+}
+
+fn rate_per_second(done: u64, elapsed: Duration) -> Option<f64> {
+    let seconds = elapsed.as_secs_f64();
+    (done > 0 && seconds > 0.0).then(|| done as f64 / seconds)
+}
+
+fn eta(run_done: u64, done: u64, total: u64, elapsed: Duration) -> Option<Duration> {
+    if done >= total {
+        return Some(Duration::ZERO);
+    }
+    let rate = rate_per_second(run_done, elapsed)?;
+    (rate > 0.0).then(|| Duration::from_secs_f64((total - done) as f64 / rate))
+}
+
+fn current_progress_round(round: u8, syn_attempts: u8, done: u64, total: u64) -> u8 {
+    if done >= total {
+        syn_attempts
+    } else {
+        round.saturating_add(1).min(syn_attempts)
+    }
+}
+
+pub fn human_progress(
+    target_count: u64,
+    syn_attempts: u8,
+    round: u8,
+    next_index: u64,
+    completed: bool,
+) -> String {
+    let total = total_progress_units(target_count, syn_attempts);
+    let done = if completed {
+        total
+    } else {
+        progress_units(target_count, syn_attempts, round, next_index)
+    };
+    format!(
+        "{}/{} probes ({:.2}%)",
+        human_count(done),
+        human_count(total),
+        progress_percent(done, total)
+    )
+}
+
+pub fn human_count(value: u64) -> String {
+    const UNITS: [&str; 4] = ["", "K", "M", "B"];
+    let mut scaled = value as f64;
+    let mut unit = 0;
+    while scaled >= 1000.0 && unit + 1 < UNITS.len() {
+        scaled /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        value.to_string()
+    } else if scaled >= 100.0 {
+        format!("{scaled:.0}{}", UNITS[unit])
+    } else {
+        format!("{scaled:.1}{}", UNITS[unit])
+    }
+}
+
+fn human_rate(rate: Option<f64>) -> String {
+    rate.map(|rate| format!("{}/s", human_count(rate.round() as u64)))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+pub fn human_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let seconds = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours:02}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn human_count_scales_large_values() {
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1_200), "1.2K");
+        assert_eq!(human_count(125_000), "125K");
+        assert_eq!(human_count(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn human_duration_uses_compact_units() {
+        assert_eq!(human_duration(Duration::from_secs(9)), "9s");
+        assert_eq!(human_duration(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(human_duration(Duration::from_secs(3_900)), "1h 05m");
+        assert_eq!(human_duration(Duration::from_secs(90_000)), "1d 01h");
+    }
+
+    #[test]
+    fn human_progress_reports_probe_attempts() {
+        assert_eq!(
+            human_progress(1_000, 3, 1, 500, false),
+            "1.5K/3.0K probes (50.00%)"
+        );
+        assert_eq!(
+            human_progress(1_000, 3, 3, 0, true),
+            "3.0K/3.0K probes (100.00%)"
+        );
+    }
 }
 
 pub fn dry_run(job: &PreparedJob) -> anyhow::Result<String> {
@@ -683,6 +887,8 @@ mod simulation {
         sent_times: &mut [u8],
         banner_states: &mut [u8],
     ) -> anyhow::Result<()> {
+        let mut progress = ProgressReporter::new(job, cfg.scan.syn_attempts);
+        progress.maybe_print(job, cfg.scan.syn_attempts, job.meta.next_index);
         for round in job.meta.round..cfg.scan.syn_attempts {
             let start_order = if round == job.meta.round {
                 job.meta.next_index
@@ -694,6 +900,7 @@ mod simulation {
             for order in start_order..job.meta.target_count {
                 let index = perm.get(order) as usize;
                 if state_rank(states[index]) != crate::TargetState::NoResponse.rank() {
+                    progress.maybe_print(job, cfg.scan.syn_attempts, order + 1);
                     continue;
                 }
                 job.meta.packets_sent = job.meta.packets_sent.saturating_add(1);
@@ -704,6 +911,7 @@ mod simulation {
                 };
                 let state = simulated_state(cfg, &job.meta.scan_id, endpoint);
                 if state == crate::TargetState::NoResponse {
+                    progress.maybe_print(job, cfg.scan.syn_attempts, order + 1);
                     continue;
                 }
                 states[index] = crate::result::encode_state_byte(state, attempts);
@@ -718,10 +926,13 @@ mod simulation {
                 if order % 10_000 == 0 {
                     job.checkpoint(order + 1)?;
                 }
+                progress.maybe_print(job, cfg.scan.syn_attempts, order + 1);
             }
             job.meta.round = round + 1;
             job.checkpoint(0)?;
+            progress.maybe_print(job, cfg.scan.syn_attempts, 0);
         }
+        progress.print_final(job, cfg.scan.syn_attempts, job.meta.next_index);
         Ok(())
     }
 
@@ -1416,6 +1627,8 @@ mod linux {
         runtime: &mut ScanRuntime,
         buffers: &mut ScanBuffers<'_>,
     ) -> anyhow::Result<()> {
+        let mut progress = ProgressReporter::new(job, cfg.scan.syn_attempts);
+        progress.maybe_print(job, cfg.scan.syn_attempts, job.meta.next_index);
         'rounds: for round in job.meta.round..cfg.scan.syn_attempts {
             let start_order = if round == job.meta.round {
                 job.meta.next_index
@@ -1440,13 +1653,16 @@ mod linux {
                 if order % 10_000 == 0 {
                     job.checkpoint(order)?;
                 }
+                progress.maybe_print(job, cfg.scan.syn_attempts, order);
             }
             job.meta.round = round + 1;
             job.checkpoint(0)?;
+            progress.maybe_print(job, cfg.scan.syn_attempts, 0);
             if round + 1 < cfg.scan.syn_attempts {
                 pause_between_rounds(cfg, runtime, buffers, round + 1);
             }
         }
+        progress.print_final(job, cfg.scan.syn_attempts, job.meta.next_index);
         Ok(())
     }
 

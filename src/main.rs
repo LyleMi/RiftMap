@@ -245,6 +245,16 @@ fn print_job_status(status: &JobStatus) {
     println!("round: {}", status.round);
     println!("syn_attempts: {}", status.syn_attempts);
     println!("next_index: {}", status.next_index);
+    println!(
+        "progress: {}",
+        riftmap::scanner::human_progress(
+            status.target_count,
+            status.syn_attempts,
+            status.round,
+            status.next_index,
+            status.completed,
+        )
+    );
     println!("progress_percent: {:.2}", status.progress_percent);
     println!(
         "summary: {}",
