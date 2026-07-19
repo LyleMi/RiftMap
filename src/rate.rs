@@ -34,6 +34,21 @@ impl TokenBucket {
             Duration::from_secs_f64(self.last_seconds - requested_seconds)
         }
     }
+
+    pub fn set_rate_at(&mut self, bytes_per_second: f64, burst_seconds: f64, now_seconds: f64) {
+        let accounted_seconds = now_seconds.max(self.last_seconds);
+        let elapsed = accounted_seconds - self.last_seconds;
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+        let fill_ratio = if self.capacity > 0.0 {
+            self.tokens / self.capacity
+        } else {
+            0.0
+        };
+        self.rate = bytes_per_second;
+        self.capacity = bytes_per_second * burst_seconds;
+        self.tokens = (self.capacity * fill_ratio).min(self.capacity);
+        self.last_seconds = accounted_seconds;
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -53,5 +68,16 @@ mod tests {
         assert_eq!(b.consume_at(100, 0.0), Duration::ZERO);
         assert_eq!(b.consume_at(50, 0.0), Duration::from_millis(500));
         assert_eq!(b.consume_at(50, 0.0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rate_can_change_without_resetting_budget() {
+        let mut b = TokenBucket::new(100.0, 1.0);
+
+        assert_eq!(b.consume_at(100, 0.0), Duration::ZERO);
+        b.set_rate_at(200.0, 1.0, 0.5);
+
+        assert_eq!(b.consume_at(100, 0.5), Duration::ZERO);
+        assert_eq!(b.consume_at(100, 0.5), Duration::from_millis(500));
     }
 }

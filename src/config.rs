@@ -175,6 +175,8 @@ pub struct NetworkConfig {
     pub provider_egress_mbps: f64,
     #[serde(default = "d_app_ratio")]
     pub application_ratio: f64,
+    #[serde(default)]
+    pub dynamic_application_mbps_file: Option<PathBuf>,
     #[serde(default = "d_tc_ratio")]
     pub tc_ratio: f64,
     #[serde(default = "d_require_tc")]
@@ -261,6 +263,11 @@ impl Config {
         if cfg.output.job_root.is_relative() {
             cfg.output.job_root = base.join(&cfg.output.job_root);
         }
+        if let Some(path) = &mut cfg.network.dynamic_application_mbps_file {
+            if path.is_relative() {
+                *path = base.join(&*path);
+            }
+        }
         cfg.validate()?;
         // Avoid retaining toml internals containing accidental future secrets.
         value = toml::Value::Table(Default::default());
@@ -315,6 +322,12 @@ impl Config {
             (0.0..=1.0).contains(&self.network.application_ratio),
             "application_ratio must be in 0..=1"
         );
+        if let Some(path) = &self.network.dynamic_application_mbps_file {
+            anyhow::ensure!(
+                !path.as_os_str().is_empty(),
+                "dynamic_application_mbps_file must not be empty"
+            );
+        }
         anyhow::ensure!(
             (0.0..=1.0).contains(&self.network.tc_ratio),
             "tc_ratio must be in 0..=1"
@@ -405,6 +418,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),

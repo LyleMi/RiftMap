@@ -85,6 +85,13 @@ estimation input; scans do not stop automatically when it is reached. Set
 `budget.enforce_time_budget=true` or `scan.max_runtime_secs` when you want a
 protective timeout.
 
+To adjust application pacing during a live scan, set
+`network.dynamic_application_mbps_file` to a local control file. The file should
+contain a positive Mbps value such as `40`; RiftMap polls it during scanning and
+keeps the previous valid rate if the file is missing, empty, or being rewritten.
+This only changes RiftMap's application token bucket. It does not change the
+host `tc` qdisc.
+
 ## Target safety
 
 Global unicast is allowed by default. RFC1918 ranges require

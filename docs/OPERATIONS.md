@@ -104,6 +104,11 @@ RiftMap has two layers of rate control:
 - The `tc-template` command prints a TBF qdisc ceiling using
   `provider_egress_mbps * tc_ratio`.
 
+Set `network.dynamic_application_mbps_file` when the application pacing limit
+must be adjusted while a scan is running. The file content is a positive Mbps
+value, for example `40`. RiftMap polls the file during scanning and keeps the
+last valid rate when the file is missing or contains a partial write.
+
 RiftMap never changes qdisc itself. With `require_tc = true`, a live scan
 refuses to run unless the root qdisc is TBF and its reported rate is at or
 below the configured ceiling.

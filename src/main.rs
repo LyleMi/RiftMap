@@ -342,6 +342,7 @@ fn validation_report(config: &Path, job: &Path) -> anyhow::Result<serde_json::Va
             "source_ip": cfg.network.source_ip.0,
             "provider_egress_mbps": cfg.network.provider_egress_mbps,
             "application_ratio": cfg.network.application_ratio,
+            "dynamic_application_mbps_file": cfg.network.dynamic_application_mbps_file,
             "tc_ratio": cfg.network.tc_ratio,
             "require_tc": cfg.network.require_tc,
             "tc_qdisc": command_json("tc", &["-s", "-j", "qdisc", "show", "dev", &cfg.network.interface]),

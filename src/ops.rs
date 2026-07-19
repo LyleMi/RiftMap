@@ -656,6 +656,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),

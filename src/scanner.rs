@@ -3,10 +3,11 @@ use base64::Engine;
 use std::{
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 #[cfg(target_os = "linux")]
-use std::{path::Path, process::Command, sync::Arc};
+use std::{path::Path, process::Command};
 
 pub fn resolve_source_ip(cfg: &Config) -> anyhow::Result<Ipv4Addr> {
     if let Some(ip) = cfg.network.source_ip.address() {
@@ -22,7 +23,7 @@ pub fn resolve_source_ip(cfg: &Config) -> anyhow::Result<Ipv4Addr> {
 pub fn estimate(cfg: &Config, count: u64) -> Estimate {
     let packets = count.saturating_mul(cfg.scan.syn_attempts as u64);
     let bytes = packets.saturating_mul(SYN_WIRE_BYTES);
-    let bps = cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio;
+    let bps = application_bytes_per_second(cfg);
     let syn_seconds = bytes as f64 / bps;
     let time_budget_secs = cfg.budget.time_budget_secs;
     let required_syn_application_mbps =
@@ -446,6 +447,7 @@ fn effective_runtime_limit_secs(cfg: &Config) -> Option<u64> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn banner_pipeline(
     job_dir: PathBuf,
     receiver: std::sync::mpsc::Receiver<Option<OpenTarget>>,
@@ -454,6 +456,7 @@ async fn banner_pipeline(
     scan_id: String,
     budget: AsyncTokenBucket,
     banner_state_file: Arc<std::sync::Mutex<std::fs::File>>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     use tokio::{sync::Semaphore, task::JoinSet, time};
     let sem = Arc::new(Semaphore::new(cfg.scan.banner_concurrency));
@@ -463,6 +466,9 @@ async fn banner_pipeline(
     let mut tasks = JoinSet::new();
     loop {
         drain_completed_banner_tasks(&mut tasks, &job_dir, &banner_state_file).await?;
+        if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(Some(target)) => {
                 ticker.tick().await;
@@ -489,6 +495,9 @@ async fn banner_pipeline(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+    if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        tasks.abort_all();
+    }
     while !tasks.is_empty() {
         drain_completed_banner_tasks(&mut tasks, &job_dir, &banner_state_file).await?;
         if !tasks.is_empty() {
@@ -504,7 +513,12 @@ async fn drain_completed_banner_tasks(
     banner_state_file: &Arc<std::sync::Mutex<std::fs::File>>,
 ) -> anyhow::Result<()> {
     while let Some(result) = tasks.try_join_next() {
-        let (index, result) = result??;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let (index, result) = result?;
         crate::job::append_event(job_dir, &result)?;
         use std::io::{Seek, SeekFrom, Write};
         let mut file = banner_state_file
@@ -534,16 +548,19 @@ struct SynObservation {
 
 #[derive(Clone)]
 struct AsyncTokenBucket {
-    inner: Arc<tokio::sync::Mutex<crate::rate::TokenBucket>>,
-    start: std::time::Instant,
+    limiter: SharedBandwidthLimiter,
 }
 
 impl AsyncTokenBucket {
+    #[cfg(test)]
     fn new(bucket: crate::rate::TokenBucket, start: std::time::Instant) -> Self {
         Self {
-            inner: Arc::new(tokio::sync::Mutex::new(bucket)),
-            start,
+            limiter: SharedBandwidthLimiter::from_bucket(bucket, start),
         }
+    }
+
+    fn from_shared(limiter: SharedBandwidthLimiter) -> Self {
+        Self { limiter }
     }
 
     async fn consume(&self, bytes: u64) {
@@ -554,10 +571,121 @@ impl AsyncTokenBucket {
     }
 
     async fn reserve(&self, bytes: u64) -> Duration {
-        let mut bucket = self.inner.lock().await;
-        bucket.consume_at(bytes, self.start.elapsed().as_secs_f64())
+        self.limiter.reserve(bytes)
     }
 }
+
+#[derive(Clone)]
+struct SharedBandwidthLimiter {
+    inner: Arc<std::sync::Mutex<BandwidthLimiter>>,
+}
+
+impl SharedBandwidthLimiter {
+    fn new(cfg: &Config, start: Instant) -> Self {
+        let configured_bps = application_bytes_per_second(cfg);
+        let dynamic_path = cfg.network.dynamic_application_mbps_file.clone();
+        let initial_bps = dynamic_path
+            .as_deref()
+            .and_then(read_dynamic_application_bps)
+            .unwrap_or(configured_bps);
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(BandwidthLimiter {
+                bucket: crate::rate::TokenBucket::new(initial_bps, TOKEN_BUCKET_BURST_SECONDS),
+                start,
+                dynamic_path,
+                current_bps: initial_bps,
+                last_reload: None,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_bucket(bucket: crate::rate::TokenBucket, start: Instant) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(BandwidthLimiter {
+                bucket,
+                start,
+                dynamic_path: None,
+                current_bps: 0.0,
+                last_reload: None,
+            })),
+        }
+    }
+
+    fn reserve(&self, bytes: u64) -> Duration {
+        let mut limiter = self.inner.lock().expect("bandwidth limiter mutex poisoned");
+        limiter.reserve(bytes)
+    }
+
+    fn consume_interruptible(&self, bytes: u64, stopping: &std::sync::atomic::AtomicBool) -> bool {
+        let mut remaining = self.reserve(bytes);
+        while !remaining.is_zero() {
+            if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            let sleep_for = remaining.min(MAX_INTERRUPTIBLE_SLEEP);
+            std::thread::sleep(sleep_for);
+            remaining = remaining.saturating_sub(sleep_for);
+        }
+        !stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct BandwidthLimiter {
+    bucket: crate::rate::TokenBucket,
+    start: Instant,
+    dynamic_path: Option<PathBuf>,
+    current_bps: f64,
+    last_reload: Option<Instant>,
+}
+
+impl BandwidthLimiter {
+    fn reserve(&mut self, bytes: u64) -> Duration {
+        self.reload_if_due();
+        self.bucket
+            .consume_at(bytes, self.start.elapsed().as_secs_f64())
+    }
+
+    fn reload_if_due(&mut self) {
+        let Some(path) = &self.dynamic_path else {
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .last_reload
+            .is_some_and(|last| now.duration_since(last) < DYNAMIC_BANDWIDTH_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.last_reload = Some(now);
+        let Some(next_bps) = read_dynamic_application_bps(path) else {
+            return;
+        };
+        if (next_bps - self.current_bps).abs() < f64::EPSILON {
+            return;
+        }
+        self.bucket.set_rate_at(
+            next_bps,
+            TOKEN_BUCKET_BURST_SECONDS,
+            self.start.elapsed().as_secs_f64(),
+        );
+        self.current_bps = next_bps;
+    }
+}
+
+fn application_bytes_per_second(cfg: &Config) -> f64 {
+    cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio
+}
+
+fn read_dynamic_application_bps(path: &std::path::Path) -> Option<f64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mbps = raw.trim().parse::<f64>().ok()?;
+    (mbps.is_finite() && mbps > 0.0).then_some(mbps * 1_000_000.0 / 8.0)
+}
+
+const TOKEN_BUCKET_BURST_SECONDS: f64 = 0.1;
+const DYNAMIC_BANDWIDTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_INTERRUPTIBLE_SLEEP: Duration = Duration::from_millis(100);
 
 struct BannerObservation {
     raw: Vec<u8>,
@@ -1072,7 +1200,7 @@ mod simulation {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use crate::{packet, rate::TokenBucket};
+    use crate::packet;
     use anyhow::Context;
     use memmap2::Mmap;
     use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
@@ -1354,7 +1482,7 @@ mod linux {
         raw: Socket,
         stopping: Arc<AtomicBool>,
         start: Instant,
-        bucket: TokenBucket,
+        limiter: SharedBandwidthLimiter,
         tx_start: TxStats,
         mss: u16,
         timed_out: Arc<AtomicBool>,
@@ -1422,10 +1550,10 @@ mod linux {
             .context("read starting interface TX counters")?;
         let mss = interface_mss(Path::new("/sys/class/net"), &cfg.network.interface)
             .context("derive SYN MSS from interface MTU")?;
-        let rate =
-            cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio;
         let stopping = Arc::new(AtomicBool::new(false));
         install_stop_handler(&stopping)?;
+        let start = Instant::now();
+        let limiter = SharedBandwidthLimiter::new(cfg, start);
         let timed_out = Arc::new(AtomicBool::new(false));
         if let Some(max_runtime_secs) = effective_runtime_limit_secs(cfg) {
             let stopping = stopping.clone();
@@ -1443,8 +1571,8 @@ mod linux {
             cap,
             raw,
             stopping,
-            start: Instant::now(),
-            bucket: TokenBucket::new(rate, 0.1),
+            start,
+            limiter,
             tx_start,
             mss,
             timed_out,
@@ -1530,8 +1658,9 @@ mod linux {
         let source_ip = runtime.source_ip;
         let cfg = cfg.clone();
         let scan_id = job.meta.scan_id.clone();
-        let budget = AsyncTokenBucket::new(runtime.bucket.clone(), runtime.start);
+        let budget = AsyncTokenBucket::from_shared(runtime.limiter.clone());
         let worker_state_file = banner_state_file.clone();
+        let stopping = runtime.stopping.clone();
         let handle = thread::spawn(move || {
             tokio::runtime::Runtime::new()?.block_on(banner_pipeline(
                 job_dir,
@@ -1541,6 +1670,7 @@ mod linux {
                 scan_id,
                 budget,
                 worker_state_file,
+                stopping,
             ))
         });
         Ok(BannerRunner { sender, handle })
@@ -1674,20 +1804,21 @@ mod linux {
     ) -> Vec<PreparedSyn> {
         let mut batch = Vec::with_capacity(SENDMMSG_BATCH);
         while *order < buffers.states.len() as u64 && batch.len() < SENDMMSG_BATCH {
-            let idx = runtime.perm.get(*order) as usize;
-            *order += 1;
+            let current_order = *order;
+            let idx = runtime.perm.get(current_order) as usize;
             if state_rank(buffers.states[idx]) != crate::TargetState::NoResponse.rank() {
+                *order += 1;
                 continue;
             }
             let ip = target_ip(buffers.targets, idx);
             let service = target_service(buffers.ports, buffers.protocols, idx);
-            let wait = runtime.bucket.consume_at(
-                packet::SYN_WIRE_BYTES,
-                runtime.start.elapsed().as_secs_f64(),
-            );
-            if !wait.is_zero() {
-                thread::sleep(wait);
+            if !runtime
+                .limiter
+                .consume_interruptible(packet::SYN_WIRE_BYTES, &runtime.stopping)
+            {
+                return batch;
             }
+            *order += 1;
             write_u32(buffers.sent_times, idx, elapsed_ms(runtime.start));
             let seq = packet::syn_cookie(
                 &runtime.seed,
@@ -1838,6 +1969,7 @@ mod linux {
         maps.states.flush()?;
         maps.rtts.flush()?;
         maps.conflicts.flush()?;
+        maps.banner_states.flush()?;
         record_capture_stats(job, &mut runtime.cap)?;
         let completed = job.meta.round >= cfg.scan.syn_attempts;
         let next_index =
@@ -2463,6 +2595,27 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_bandwidth_file_updates_limiter() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let control = temp.path().join("application-mbps");
+        std::fs::write(&control, "16\n")?;
+        let mut limiter = super::BandwidthLimiter {
+            bucket: crate::rate::TokenBucket::new(1_000_000.0, super::TOKEN_BUCKET_BURST_SECONDS),
+            start: Instant::now(),
+            dynamic_path: Some(control.clone()),
+            current_bps: 1_000_000.0,
+            last_reload: Some(Instant::now() - Duration::from_secs(2)),
+        };
+
+        assert_eq!(limiter.reserve(200_000), Duration::ZERO);
+        std::fs::write(&control, "not-yet-valid")?;
+        limiter.last_reload = Some(Instant::now() - Duration::from_secs(2));
+
+        assert!(limiter.reserve(200_000) <= Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
     fn estimate_reports_time_budget_bottlenecks() {
         let cfg = crate::Config {
             scan: ScanConfig {
@@ -2496,6 +2649,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 1.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),
@@ -2560,6 +2714,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),
@@ -2620,6 +2775,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: true,
                 accounting: "estimated-wire".into(),

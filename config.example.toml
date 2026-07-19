@@ -39,6 +39,9 @@ interface = "eth0"
 source_ip = "auto"
 provider_egress_mbps = 100
 application_ratio = 0.80
+# Optional live override for application pacing. The file content is a positive
+# Mbps value, for example "40"; invalid or partial writes keep the last value.
+# dynamic_application_mbps_file = ".riftmap/application-mbps"
 tc_ratio = 0.85
 require_tc = true
 accounting = "estimated-wire"
