@@ -1,13 +1,11 @@
 use crate::{Config, job::PreparedJob, packet::SYN_WIRE_BYTES, permutation::Permutation};
+use base64::Engine;
 use std::{
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     path::PathBuf,
 };
 #[cfg(target_os = "linux")]
-use {
-    base64::Engine,
-    std::{path::Path, process::Command, sync::Arc, time::Duration},
-};
+use std::{path::Path, process::Command, sync::Arc, time::Duration};
 
 pub fn resolve_source_ip(cfg: &Config) -> anyhow::Result<Ipv4Addr> {
     if let Some(ip) = cfg.network.source_ip.address() {
@@ -216,6 +214,9 @@ fn verify_tc(cfg: &Config) -> anyhow::Result<()> {
 }
 
 pub fn scan(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> {
+    if cfg.simulation.enabled {
+        return simulation::run(job, cfg);
+    }
     #[cfg(target_os = "linux")]
     {
         linux::run(job, cfg)
@@ -535,6 +536,326 @@ pub struct ScanSummary {
 
 fn final_checkpoint_index(completed: bool, target_count: u64, next_index: u64) -> u64 {
     if completed { target_count } else { next_index }
+}
+
+fn read_u32(data: &[u8], index: usize) -> u32 {
+    let offset = index * 4;
+    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+}
+
+fn write_u32(data: &mut [u8], index: usize, value: u32) {
+    let offset = index * 4;
+    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn decode_rtt_ms(rtts: &[u8], index: usize) -> Option<f64> {
+    let stored = read_u32(rtts, index);
+    (stored != 0).then(|| f64::from(stored - 1) / 1000.0)
+}
+
+fn target_ip(targets: &[u8], index: usize) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from_be_bytes(
+        targets[index * 4..index * 4 + 4].try_into().unwrap(),
+    ))
+}
+
+fn target_port(ports: &[u8], index: usize) -> u16 {
+    let offset = index * 2;
+    u16::from_be_bytes(ports[offset..offset + 2].try_into().unwrap())
+}
+
+fn target_protocol(protocols: &[u8], index: usize) -> crate::Protocol {
+    crate::job::protocol_from_code(protocols[index]).unwrap_or(crate::Protocol::Ssh)
+}
+
+fn target_service(ports: &[u8], protocols: &[u8], index: usize) -> crate::config::ServiceConfig {
+    crate::config::ServiceConfig {
+        port: target_port(ports, index),
+        protocol: target_protocol(protocols, index),
+    }
+}
+
+fn summary_banner_counts(summary: &mut ScanSummary, banner_states: &[u8]) {
+    summary.banner_queued = 0;
+    summary.banner_done = 0;
+    for &state in banner_states {
+        match state {
+            crate::job::BANNER_QUEUED_OR_RUNNING => summary.banner_queued += 1,
+            crate::job::BANNER_DONE => summary.banner_done += 1,
+            _ => {}
+        }
+    }
+    summary.banner_failed_or_incomplete = summary.open.saturating_sub(summary.banner_done);
+}
+
+fn summarize_state_bytes(
+    completed: bool,
+    job: &PreparedJob,
+    states: &[u8],
+    conflicts: &[u8],
+    banner_states: &[u8],
+    timed_out: bool,
+) -> ScanSummary {
+    let mut summary = ScanSummary {
+        completed,
+        sent: job.meta.packets_sent,
+        pcap_drops: job.meta.pcap_drops,
+        timed_out,
+        ..Default::default()
+    };
+    for &v in states {
+        match crate::result::decode_state_byte(v)
+            .map(|(state, _)| state)
+            .unwrap_or(crate::TargetState::NoResponse)
+        {
+            crate::TargetState::Open => summary.open += 1,
+            crate::TargetState::Closed => summary.closed += 1,
+            crate::TargetState::Unreachable => summary.unreachable += 1,
+            crate::TargetState::NoResponse => summary.no_response += 1,
+        }
+    }
+    for index in 0..states.len() {
+        summary.conflicting_observations += u64::from(read_u32(conflicts, index));
+    }
+    summary_banner_counts(&mut summary, banner_states);
+    summary
+}
+
+mod simulation {
+    use super::*;
+    use memmap2::Mmap;
+    use std::fs::File;
+
+    pub fn run(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> {
+        job.ensure_endpoint_files(cfg)?;
+        let seed = crate::job::decode_seed(&job.meta.seed_hex)?;
+        let perm = Permutation::new(job.meta.target_count, seed)?;
+        let target_file = File::open(job.dir.join("targets.bin"))?;
+        let port_file = File::open(job.dir.join("ports.bin"))?;
+        let protocol_file = File::open(job.dir.join("protocols.bin"))?;
+        let targets = unsafe { Mmap::map(&target_file)? };
+        let ports = unsafe { Mmap::map(&port_file)? };
+        let protocols = unsafe { Mmap::map(&protocol_file)? };
+        let mut states = job.states()?;
+        let mut rtts = job.rtts()?;
+        let mut sent_times = job.sent_times()?;
+        let conflicts = job.conflicts()?;
+        let mut banner_states = crate::job::ensure_banner_state_backfilled(job, cfg)?;
+
+        send_rounds(
+            job,
+            cfg,
+            &perm,
+            &targets,
+            &ports,
+            &protocols,
+            &mut states,
+            &mut rtts,
+            &mut sent_times,
+            &mut banner_states,
+        )?;
+
+        states.flush()?;
+        rtts.flush()?;
+        sent_times.flush()?;
+        conflicts.flush()?;
+        banner_states.flush()?;
+        let completed = job.meta.round >= cfg.scan.syn_attempts;
+        let next_index =
+            final_checkpoint_index(completed, job.meta.target_count, job.meta.next_index);
+        job.checkpoint(next_index)?;
+        let summary =
+            summarize_state_bytes(completed, job, &states, &conflicts, &banner_states, false);
+        crate::job::save_summary(&job.dir, &summary)?;
+        Ok(summary)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_rounds(
+        job: &mut PreparedJob,
+        cfg: &Config,
+        perm: &Permutation,
+        targets: &[u8],
+        ports: &[u8],
+        protocols: &[u8],
+        states: &mut [u8],
+        rtts: &mut [u8],
+        sent_times: &mut [u8],
+        banner_states: &mut [u8],
+    ) -> anyhow::Result<()> {
+        for round in job.meta.round..cfg.scan.syn_attempts {
+            let start_order = if round == job.meta.round {
+                job.meta.next_index
+            } else {
+                0
+            };
+            job.meta.round = round;
+            let attempts = round + 1;
+            for order in start_order..job.meta.target_count {
+                let index = perm.get(order) as usize;
+                if state_rank(states[index]) != crate::TargetState::NoResponse.rank() {
+                    continue;
+                }
+                job.meta.packets_sent = job.meta.packets_sent.saturating_add(1);
+                write_u32(sent_times, index, simulated_sent_ms(order, attempts));
+                let endpoint = SimEndpoint {
+                    ip: target_ip(targets, index),
+                    service: target_service(ports, protocols, index),
+                };
+                let state = simulated_state(cfg, &job.meta.scan_id, endpoint);
+                if state == crate::TargetState::NoResponse {
+                    continue;
+                }
+                states[index] = crate::result::encode_state_byte(state, attempts);
+                write_u32(
+                    rtts,
+                    index,
+                    simulated_rtt_us(cfg, &job.meta.scan_id, endpoint),
+                );
+                if state == crate::TargetState::Open && cfg.simulation.banner {
+                    append_banner_event(job, endpoint, index, attempts, rtts, banner_states)?;
+                }
+                if order % 10_000 == 0 {
+                    job.checkpoint(order + 1)?;
+                }
+            }
+            job.meta.round = round + 1;
+            job.checkpoint(0)?;
+        }
+        Ok(())
+    }
+
+    fn append_banner_event(
+        job: &PreparedJob,
+        endpoint: SimEndpoint,
+        index: usize,
+        attempts: u8,
+        rtts: &[u8],
+        banner_states: &mut [u8],
+    ) -> anyhow::Result<()> {
+        if banner_states[index] == crate::job::BANNER_DONE {
+            return Ok(());
+        }
+        let raw = simulated_banner(endpoint.service.protocol);
+        let parsed = crate::protocol::parse(endpoint.service.protocol, &raw).map_err(|status| {
+            anyhow::anyhow!(
+                "parse simulated {:?} banner failed with {:?}",
+                endpoint.service.protocol,
+                status
+            )
+        })?;
+        let result = make_result(
+            &job.meta.scan_id,
+            endpoint.ip,
+            endpoint.service,
+            SynObservation {
+                attempts,
+                rtt_ms: decode_rtt_ms(rtts, index),
+                conflicting_observations: 0,
+            },
+            BannerObservation {
+                raw,
+                status: crate::BannerStatus::Ok,
+                parsed: Some(parsed),
+            },
+        );
+        crate::job::append_event(&job.dir, &result)?;
+        banner_states[index] = crate::job::BANNER_DONE;
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    struct SimEndpoint {
+        ip: Ipv4Addr,
+        service: crate::config::ServiceConfig,
+    }
+
+    fn simulated_state(cfg: &Config, scan_id: &str, endpoint: SimEndpoint) -> crate::TargetState {
+        let sample = hash_unit(cfg, scan_id, endpoint, b"state");
+        let open = cfg.simulation.open_ratio;
+        let closed = open + cfg.simulation.closed_ratio;
+        let unreachable = closed + cfg.simulation.unreachable_ratio;
+        if sample < open {
+            crate::TargetState::Open
+        } else if sample < closed {
+            crate::TargetState::Closed
+        } else if sample < unreachable {
+            crate::TargetState::Unreachable
+        } else {
+            crate::TargetState::NoResponse
+        }
+    }
+
+    fn simulated_rtt_us(cfg: &Config, scan_id: &str, endpoint: SimEndpoint) -> u32 {
+        let sample = hash_unit(cfg, scan_id, endpoint, b"rtt");
+        let rtt_ms = cfg.simulation.rtt_min_ms
+            + (cfg.simulation.rtt_max_ms - cfg.simulation.rtt_min_ms) * sample;
+        let micros = (rtt_ms * 1000.0).round();
+        (micros as u32).saturating_add(1)
+    }
+
+    fn hash_unit(cfg: &Config, scan_id: &str, endpoint: SimEndpoint, domain: &[u8]) -> f64 {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(cfg.simulation.seed.as_bytes());
+        hasher.update(scan_id.as_bytes());
+        hasher.update(domain);
+        hasher.update(&endpoint.ip.octets());
+        hasher.update(&endpoint.service.port.to_be_bytes());
+        hasher.update(&[crate::job::protocol_code(endpoint.service.protocol)]);
+        let hash = hasher.finalize();
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(&hash.as_bytes()[..8]);
+        u64::from_be_bytes(bytes) as f64 / (u64::MAX as f64 + 1.0)
+    }
+
+    fn simulated_sent_ms(order: u64, attempts: u8) -> u32 {
+        let value = order
+            .saturating_add(u64::from(attempts))
+            .min(u64::from(u32::MAX));
+        value as u32
+    }
+
+    fn state_rank(value: u8) -> u8 {
+        crate::result::decode_state_byte(value)
+            .map(|(state, _)| state.rank())
+            .unwrap_or(crate::TargetState::NoResponse.rank())
+    }
+
+    fn simulated_banner(protocol: crate::Protocol) -> Vec<u8> {
+        match protocol {
+            crate::Protocol::Ssh => b"SSH-2.0-RiftMapSim_1.0\r\n".to_vec(),
+            crate::Protocol::Ftp => b"220 riftmap-sim FTP ready\r\n".to_vec(),
+            crate::Protocol::Mysql => mysql_banner(),
+            crate::Protocol::Smtp => b"220 riftmap-sim ESMTP ready\r\n".to_vec(),
+            crate::Protocol::Redis => b"+PONG\r\n".to_vec(),
+            crate::Protocol::Postgres => postgres_banner(),
+        }
+    }
+
+    fn mysql_banner() -> Vec<u8> {
+        let mut payload = vec![10];
+        payload.extend_from_slice(b"8.0.36-riftmap-sim\0");
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(b"12345678");
+        payload.push(0);
+        payload.extend_from_slice(&0x1234u16.to_le_bytes());
+        payload.push(45);
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(&0x5678u16.to_le_bytes());
+        let len = payload.len();
+        let mut packet = vec![(len & 0xff) as u8, ((len >> 8) & 0xff) as u8, 0, 0];
+        packet.extend_from_slice(&payload);
+        packet
+    }
+
+    fn postgres_banner() -> Vec<u8> {
+        let payload = b"SERROR\0Msimulated startup response\0\0";
+        let len = (payload.len() + 4) as u32;
+        let mut packet = vec![b'E'];
+        packet.extend_from_slice(&len.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1899,8 +2220,10 @@ mod tests {
     use super::ScanSummary;
     use super::{AsyncTokenBucket, effective_runtime_limit_secs, estimate, final_checkpoint_index};
     use crate::config::{
-        BudgetConfig, NetworkConfig, OutputConfig, Protocol, ScanConfig, SourceIp, TargetsConfig,
+        BudgetConfig, NetworkConfig, OutputConfig, Protocol, ScanConfig, ServiceConfig,
+        SimulationConfig, SourceIp, TargetsConfig,
     };
+    use crate::job::PreparedJob;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -1965,6 +2288,7 @@ mod tests {
                 job_root: PathBuf::from("."),
                 output_all: false,
             },
+            simulation: Default::default(),
         };
 
         let estimate = estimate(&cfg, 10_000_000);
@@ -2028,6 +2352,7 @@ mod tests {
                 job_root: PathBuf::from("."),
                 output_all: false,
             },
+            simulation: Default::default(),
         };
 
         assert_eq!(effective_runtime_limit_secs(&cfg), Some(100));
@@ -2035,6 +2360,84 @@ mod tests {
         assert_eq!(effective_runtime_limit_secs(&cfg), Some(30));
         cfg.scan.max_runtime_secs = None;
         assert_eq!(effective_runtime_limit_secs(&cfg), Some(30));
+    }
+
+    #[test]
+    fn simulation_scan_writes_job_events_and_summary() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let targets = temp.path().join("targets.txt");
+        std::fs::write(&targets, "10.0.0.1\n10.0.0.2\n")?;
+        let cfg = crate::Config {
+            scan: ScanConfig {
+                port: 22,
+                protocol: Protocol::Ssh,
+                services: vec![
+                    ServiceConfig {
+                        port: 22,
+                        protocol: Protocol::Ssh,
+                    },
+                    ServiceConfig {
+                        port: 6379,
+                        protocol: Protocol::Redis,
+                    },
+                ],
+                syn_attempts: 3,
+                source_port: 61_000,
+                connect_timeout_ms: 3_000,
+                banner_timeout_ms: 5_000,
+                banner_max_bytes: 4_096,
+                banner_attempts: 2,
+                banner_concurrency: 512,
+                banner_connects_per_second: 200,
+                banner_queue_capacity: 1024,
+                max_runtime_secs: None,
+            },
+            budget: BudgetConfig::default(),
+            targets: TargetsConfig {
+                include: vec![targets],
+                exclude: vec![],
+                allow_private: true,
+                max_targets: 10,
+            },
+            network: NetworkConfig {
+                interface: "lo".into(),
+                source_ip: SourceIp("127.0.0.1".into()),
+                provider_egress_mbps: 100.0,
+                application_ratio: 0.8,
+                tc_ratio: 0.85,
+                require_tc: true,
+                accounting: "estimated-wire".into(),
+            },
+            output: OutputConfig {
+                job_root: temp.path().join("jobs"),
+                output_all: false,
+            },
+            simulation: SimulationConfig {
+                enabled: true,
+                open_ratio: 1.0,
+                closed_ratio: 0.0,
+                unreachable_ratio: 0.0,
+                seed: "test-sim".into(),
+                rtt_min_ms: 5.0,
+                rtt_max_ms: 5.0,
+                banner: true,
+            },
+        };
+        let mut job = PreparedJob::create(&cfg, Some([9; 32]))?;
+
+        let summary = super::scan(&mut job, &cfg)?;
+
+        assert!(summary.completed);
+        assert_eq!(summary.sent, 4);
+        assert_eq!(summary.open, 4);
+        assert_eq!(summary.banner_done, 4);
+        assert_eq!(summary.banner_failed_or_incomplete, 0);
+        assert_eq!(summary.pcap_drops, 0);
+        assert_eq!(summary.interface_tx_packets, None);
+        let events = std::fs::read_to_string(job.dir.join("events.ndjson"))?;
+        assert_eq!(events.lines().count(), 4);
+        assert_eq!(crate::job::export(&job.dir, false)?, 4);
+        Ok(())
     }
 
     #[test]

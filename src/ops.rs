@@ -664,6 +664,7 @@ mod tests {
                 job_root: root.into(),
                 output_all: false,
             },
+            simulation: Default::default(),
         }
     }
 

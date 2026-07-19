@@ -46,3 +46,14 @@ accounting = "estimated-wire"
 [output]
 job_root = ".riftmap/jobs"
 output_all = false
+
+[simulation]
+# Set true to exercise the full job/export/report pipeline without touching the network.
+enabled = false
+open_ratio = 0.01
+closed_ratio = 0.10
+unreachable_ratio = 0.01
+seed = "riftmap-sim-v1"
+rtt_min_ms = 1.0
+rtt_max_ms = 200.0
+banner = true

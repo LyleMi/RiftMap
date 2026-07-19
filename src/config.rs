@@ -53,6 +53,24 @@ pub(crate) fn d_accounting() -> String {
 pub(crate) fn d_job_root() -> PathBuf {
     ".riftmap/jobs".into()
 }
+pub(crate) fn d_sim_seed() -> String {
+    "riftmap-sim-v1".into()
+}
+pub(crate) fn d_sim_open_ratio() -> f64 {
+    0.01
+}
+pub(crate) fn d_sim_closed_ratio() -> f64 {
+    0.10
+}
+pub(crate) fn d_sim_unreachable_ratio() -> f64 {
+    0.01
+}
+pub(crate) fn d_sim_rtt_min_ms() -> f64 {
+    1.0
+}
+pub(crate) fn d_sim_rtt_max_ms() -> f64 {
+    200.0
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -174,6 +192,45 @@ pub struct OutputConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "d_sim_open_ratio")]
+    pub open_ratio: f64,
+    #[serde(default = "d_sim_closed_ratio")]
+    pub closed_ratio: f64,
+    #[serde(default = "d_sim_unreachable_ratio")]
+    pub unreachable_ratio: f64,
+    #[serde(default = "d_sim_seed")]
+    pub seed: String,
+    #[serde(default = "d_sim_rtt_min_ms")]
+    pub rtt_min_ms: f64,
+    #[serde(default = "d_sim_rtt_max_ms")]
+    pub rtt_max_ms: f64,
+    #[serde(default = "d_true")]
+    pub banner: bool,
+}
+
+impl Default for SimulationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            open_ratio: d_sim_open_ratio(),
+            closed_ratio: d_sim_closed_ratio(),
+            unreachable_ratio: d_sim_unreachable_ratio(),
+            seed: d_sim_seed(),
+            rtt_min_ms: d_sim_rtt_min_ms(),
+            rtt_max_ms: d_sim_rtt_max_ms(),
+            banner: true,
+        }
+    }
+}
+
+fn d_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub scan: ScanConfig,
     #[serde(default)]
@@ -181,6 +238,8 @@ pub struct Config {
     pub targets: TargetsConfig,
     pub network: NetworkConfig,
     pub output: OutputConfig,
+    #[serde(default)]
+    pub simulation: SimulationConfig,
 }
 
 impl Config {
@@ -285,6 +344,99 @@ impl Config {
             self.network.source_ip.is_auto() || self.network.source_ip.address().is_some(),
             "source_ip must be auto or IPv4"
         );
+        for (name, ratio) in [
+            ("simulation.open_ratio", self.simulation.open_ratio),
+            ("simulation.closed_ratio", self.simulation.closed_ratio),
+            (
+                "simulation.unreachable_ratio",
+                self.simulation.unreachable_ratio,
+            ),
+        ] {
+            anyhow::ensure!((0.0..=1.0).contains(&ratio), "{name} must be in 0..=1");
+        }
+        anyhow::ensure!(
+            self.simulation.open_ratio
+                + self.simulation.closed_ratio
+                + self.simulation.unreachable_ratio
+                <= 1.0,
+            "simulation state ratios must not exceed 1.0 in total"
+        );
+        anyhow::ensure!(
+            self.simulation.rtt_min_ms.is_finite()
+                && self.simulation.rtt_max_ms.is_finite()
+                && self.simulation.rtt_min_ms >= 0.0
+                && self.simulation.rtt_max_ms >= self.simulation.rtt_min_ms,
+            "simulation RTT range is invalid"
+        );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_simulation(simulation: SimulationConfig) -> Config {
+        Config {
+            scan: ScanConfig {
+                port: 22,
+                protocol: Protocol::Ssh,
+                services: vec![],
+                syn_attempts: 3,
+                source_port: 61_000,
+                connect_timeout_ms: 3_000,
+                banner_timeout_ms: 5_000,
+                banner_max_bytes: 4_096,
+                banner_attempts: 2,
+                banner_concurrency: 8,
+                banner_connects_per_second: 10,
+                banner_queue_capacity: 128,
+                max_runtime_secs: None,
+            },
+            budget: BudgetConfig::default(),
+            targets: TargetsConfig {
+                include: vec![PathBuf::from("targets.txt")],
+                exclude: vec![],
+                allow_private: true,
+                max_targets: 10,
+            },
+            network: NetworkConfig {
+                interface: "lo".into(),
+                source_ip: SourceIp("127.0.0.1".into()),
+                provider_egress_mbps: 100.0,
+                application_ratio: 0.8,
+                tc_ratio: 0.85,
+                require_tc: false,
+                accounting: "estimated-wire".into(),
+            },
+            output: OutputConfig {
+                job_root: PathBuf::from("."),
+                output_all: false,
+            },
+            simulation,
+        }
+    }
+
+    #[test]
+    fn simulation_defaults_are_valid() -> anyhow::Result<()> {
+        config_with_simulation(SimulationConfig::default()).validate()
+    }
+
+    #[test]
+    fn simulation_ratios_must_not_exceed_one() {
+        let cfg = config_with_simulation(SimulationConfig {
+            enabled: true,
+            open_ratio: 0.6,
+            closed_ratio: 0.3,
+            unreachable_ratio: 0.2,
+            ..Default::default()
+        });
+
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must not exceed 1.0")
+        );
     }
 }

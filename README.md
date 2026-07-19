@@ -66,6 +66,12 @@ riftmap export --job .riftmap/jobs/<scan-id> --state open --banner-status ok --f
 riftmap job prune -c config.local.toml --older-than-days 30 --dry-run
 ```
 
+For development and CI-scale pipeline validation without network traffic, set
+`[simulation].enabled=true`. Simulated scans materialize normal jobs, summaries,
+events, exports, and reports, but skip raw sockets, pcap, `tc`, and interface
+counters. Use `[simulation]` ratios to choose deterministic open, closed,
+unreachable, and no-response distributions.
+
 RiftMap never changes qdisc. With `require_tc=true`, it refuses a live scan
 unless the root qdisc is TBF. The application budget defaults to 80% of the
 provider rate and the suggested TBF ceiling to 85%. Estimated SYN wire cost is

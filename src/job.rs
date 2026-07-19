@@ -769,6 +769,7 @@ mod tests {
                 job_root: root.into(),
                 output_all,
             },
+            simulation: Default::default(),
         }
     }
 
