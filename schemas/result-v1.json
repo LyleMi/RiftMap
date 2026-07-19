@@ -54,7 +54,20 @@
       "properties": {
         "protocol_version": { "type": ["string", "null"] },
         "software_version": { "type": ["string", "null"] },
-        "comments": { "type": ["string", "null"] }
+        "comments": { "type": ["string", "null"] },
+        "implementation": { "type": ["string", "null"] },
+        "implementation_version": { "type": ["string", "null"] },
+        "probe_mode": {
+          "enum": ["passive_banner", "version_exchange", "kexinit_probe", null]
+        },
+        "kex_algorithms": { "$ref": "#/$defs/stringListOrNull" },
+        "server_host_key_algorithms": { "$ref": "#/$defs/stringListOrNull" },
+        "encryption_algorithms_client_to_server": { "$ref": "#/$defs/stringListOrNull" },
+        "encryption_algorithms_server_to_client": { "$ref": "#/$defs/stringListOrNull" },
+        "mac_algorithms_client_to_server": { "$ref": "#/$defs/stringListOrNull" },
+        "mac_algorithms_server_to_client": { "$ref": "#/$defs/stringListOrNull" },
+        "compression_algorithms_client_to_server": { "$ref": "#/$defs/stringListOrNull" },
+        "compression_algorithms_server_to_client": { "$ref": "#/$defs/stringListOrNull" }
       }
     },
     "ftp": {
@@ -100,6 +113,12 @@
         "severity": { "type": ["string", "null"] },
         "message": { "type": ["string", "null"] }
       }
+    }
+  },
+  "$defs": {
+    "stringListOrNull": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
     }
   }
 }

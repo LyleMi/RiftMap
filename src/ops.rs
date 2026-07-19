@@ -643,6 +643,7 @@ mod tests {
                 banner_connects_per_second: 10,
                 banner_queue_capacity: 128,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: Default::default(),
             targets: TargetsConfig {
@@ -1010,6 +1011,7 @@ job_root = "jobs"
                     protocol_version: Some("2.0".into()),
                     software_version: Some("OpenSSH_9.6".into()),
                     comments: None,
+                    ..Default::default()
                 }),
                 ftp: None,
                 mysql: None,

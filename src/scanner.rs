@@ -718,19 +718,206 @@ async fn inspect_banner(
             }
         };
         observation.raw.clear();
-        observation.status = read_banner(&mut stream, scan, service, &mut observation.raw).await;
+        if service.protocol == crate::Protocol::Ssh {
+            observation.status = inspect_ssh_stream(&mut stream, scan, &mut observation).await;
+        } else {
+            observation.status =
+                read_banner(&mut stream, scan, service, &mut observation.raw).await;
+        }
         if observation.status == crate::BannerStatus::Ok {
-            match crate::protocol::parse(service.protocol, &observation.raw) {
-                Ok(parsed) => observation.parsed = Some(parsed),
-                Err(status) => observation.status = status,
+            if observation.parsed.is_none() {
+                match crate::protocol::parse(service.protocol, &observation.raw) {
+                    Ok(mut parsed) => {
+                        if let Some(ssh) = parsed.ssh.as_mut() {
+                            ssh.probe_mode = Some(ssh_probe_mode_name(scan.ssh.probe_mode).into());
+                        }
+                        observation.parsed = Some(parsed);
+                    }
+                    Err(status) => observation.status = status,
+                }
+            } else if let Some(ssh) = observation
+                .parsed
+                .as_mut()
+                .and_then(|parsed| parsed.ssh.as_mut())
+            {
+                ssh.probe_mode = Some(ssh_probe_mode_name(scan.ssh.probe_mode).into());
             }
-            break;
+            if observation.status == crate::BannerStatus::Ok {
+                break;
+            } else {
+                if terminal_banner_status(observation.status) {
+                    break;
+                }
+            }
         }
         if terminal_banner_status(observation.status) {
             break;
         }
     }
     Ok(make_result(scan_id, ip, service, syn, observation))
+}
+
+async fn inspect_ssh_stream(
+    stream: &mut tokio::net::TcpStream,
+    scan: &crate::config::ScanConfig,
+    observation: &mut BannerObservation,
+) -> crate::BannerStatus {
+    use tokio::io::AsyncWriteExt;
+
+    let service = crate::config::ServiceConfig {
+        port: 22,
+        protocol: crate::Protocol::Ssh,
+    };
+    let status = read_banner(stream, scan, service, &mut observation.raw).await;
+    if status != crate::BannerStatus::Ok {
+        return status;
+    }
+    if scan.ssh.probe_mode == crate::config::SshProbeMode::PassiveBanner {
+        return status;
+    }
+    let client_id = format!("{}\r\n", scan.ssh.client_id);
+    match tokio::time::timeout(
+        Duration::from_millis(scan.banner_timeout_ms),
+        stream.write_all(client_id.as_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return status,
+    }
+    if scan.ssh.probe_mode != crate::config::SshProbeMode::KexinitProbe {
+        return status;
+    }
+    let packet = build_ssh_kexinit_probe();
+    match tokio::time::timeout(
+        Duration::from_millis(scan.banner_timeout_ms),
+        stream.write_all(&packet),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return status,
+    }
+    let Ok(Some(server_kexinit)) = read_ssh_packet(stream, scan).await else {
+        return status;
+    };
+    let Ok(kex) = crate::protocol::parse_ssh_kexinit_packet(&server_kexinit) else {
+        return status;
+    };
+    let mut parsed = crate::protocol::parse(crate::Protocol::Ssh, &observation.raw).ok();
+    if let Some(ssh) = parsed.as_mut().and_then(|parsed| parsed.ssh.as_mut()) {
+        ssh.kex_algorithms = Some(kex.kex_algorithms);
+        ssh.server_host_key_algorithms = Some(kex.server_host_key_algorithms);
+        ssh.encryption_algorithms_client_to_server =
+            Some(kex.encryption_algorithms_client_to_server);
+        ssh.encryption_algorithms_server_to_client =
+            Some(kex.encryption_algorithms_server_to_client);
+        ssh.mac_algorithms_client_to_server = Some(kex.mac_algorithms_client_to_server);
+        ssh.mac_algorithms_server_to_client = Some(kex.mac_algorithms_server_to_client);
+        ssh.compression_algorithms_client_to_server =
+            Some(kex.compression_algorithms_client_to_server);
+        ssh.compression_algorithms_server_to_client =
+            Some(kex.compression_algorithms_server_to_client);
+    }
+    observation.parsed = parsed;
+    status
+}
+
+async fn read_ssh_packet(
+    stream: &mut tokio::net::TcpStream,
+    scan: &crate::config::ScanConfig,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = [0u8; 5];
+    match tokio::time::timeout(
+        Duration::from_millis(scan.banner_timeout_ms),
+        stream.read_exact(&mut header),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => return Ok(None),
+    }
+    let packet_len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+    let total = packet_len
+        .checked_add(4)
+        .filter(|total| *total <= scan.banner_max_bytes)
+        .ok_or_else(|| anyhow::anyhow!("SSH KEXINIT packet exceeds banner_max_bytes"))?;
+    let mut packet = Vec::with_capacity(total);
+    packet.extend_from_slice(&header);
+    packet.resize(total, 0);
+    tokio::time::timeout(
+        Duration::from_millis(scan.banner_timeout_ms),
+        stream.read_exact(&mut packet[5..]),
+    )
+    .await??;
+    Ok(Some(packet))
+}
+
+fn build_ssh_kexinit_probe() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(20);
+    payload.extend_from_slice(&rand::random::<[u8; 16]>());
+    write_ssh_namelist(
+        &mut payload,
+        &[
+            "curve25519-sha256",
+            "curve25519-sha256@libssh.org",
+            "ecdh-sha2-nistp256",
+            "diffie-hellman-group14-sha256",
+        ],
+    );
+    write_ssh_namelist(
+        &mut payload,
+        &[
+            "ssh-ed25519",
+            "ecdsa-sha2-nistp256",
+            "rsa-sha2-512",
+            "rsa-sha2-256",
+            "ssh-rsa",
+        ],
+    );
+    for _ in 0..2 {
+        write_ssh_namelist(&mut payload, &["aes128-ctr", "aes256-ctr"]);
+    }
+    for _ in 0..2 {
+        write_ssh_namelist(&mut payload, &["hmac-sha2-256", "hmac-sha1"]);
+    }
+    for _ in 0..2 {
+        write_ssh_namelist(&mut payload, &["none"]);
+    }
+    write_ssh_namelist(&mut payload, &[]);
+    write_ssh_namelist(&mut payload, &[]);
+    payload.push(0);
+    payload.extend_from_slice(&0u32.to_be_bytes());
+
+    let block_size = 8;
+    let mut padding_len = block_size - ((payload.len() + 5) % block_size);
+    if padding_len < 4 {
+        padding_len += block_size;
+    }
+    let packet_len = payload.len() + padding_len + 1;
+    let mut packet = Vec::with_capacity(packet_len + 4);
+    packet.extend_from_slice(&(packet_len as u32).to_be_bytes());
+    packet.push(padding_len as u8);
+    packet.extend_from_slice(&payload);
+    packet.extend(std::iter::repeat_n(0, padding_len));
+    packet
+}
+
+fn write_ssh_namelist(out: &mut Vec<u8>, names: &[&str]) {
+    let value = names.join(",");
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn ssh_probe_mode_name(mode: crate::config::SshProbeMode) -> &'static str {
+    match mode {
+        crate::config::SshProbeMode::PassiveBanner => "passive_banner",
+        crate::config::SshProbeMode::VersionExchange => "version_exchange",
+        crate::config::SshProbeMode::KexinitProbe => "kexinit_probe",
+    }
 }
 
 async fn connect_banner(
@@ -2112,6 +2299,7 @@ mod linux {
                 banner_connects_per_second: 1,
                 banner_queue_capacity: 8,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             }
         }
 
@@ -2632,6 +2820,7 @@ mod tests {
                 banner_connects_per_second: 200,
                 banner_queue_capacity: 1024,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: BudgetConfig {
                 time_budget_secs: Some(7_200),
@@ -2697,6 +2886,7 @@ mod tests {
                 banner_connects_per_second: 200,
                 banner_queue_capacity: 1024,
                 max_runtime_secs: Some(100),
+                ssh: Default::default(),
             },
             budget: BudgetConfig {
                 time_budget_secs: Some(30),
@@ -2762,6 +2952,7 @@ mod tests {
                 banner_connects_per_second: 200,
                 banner_queue_capacity: 1024,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: BudgetConfig::default(),
             targets: TargetsConfig {

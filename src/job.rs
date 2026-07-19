@@ -748,6 +748,7 @@ mod tests {
                 banner_connects_per_second: 10,
                 banner_queue_capacity: 128,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: Default::default(),
             targets: TargetsConfig {

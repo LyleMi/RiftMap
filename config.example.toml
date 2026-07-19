@@ -21,6 +21,15 @@ banner_queue_capacity = 8192
 # Optional protection only; time budgets below are for estimation and do not stop scans.
 # max_runtime_secs = 86400
 
+[scan.ssh]
+# passive_banner keeps the original safety model: connect, read the server
+# identification line, and close without sending SSH protocol data.
+# version_exchange additionally sends client_id after the server banner.
+# kexinit_probe sends client_id plus a minimal KEXINIT packet and records the
+# server's advertised SSH algorithms when available.
+probe_mode = "passive_banner"
+client_id = "SSH-2.0-RiftMap_0.1"
+
 [budget]
 # Optional estimation inputs for large jobs.
 # time_budget_secs = 7200

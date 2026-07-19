@@ -56,6 +56,28 @@ pub struct SshFields {
     pub protocol_version: Option<String>,
     pub software_version: Option<String>,
     pub comments: Option<String>,
+    #[serde(default)]
+    pub implementation: Option<String>,
+    #[serde(default)]
+    pub implementation_version: Option<String>,
+    #[serde(default)]
+    pub probe_mode: Option<String>,
+    #[serde(default)]
+    pub kex_algorithms: Option<Vec<String>>,
+    #[serde(default)]
+    pub server_host_key_algorithms: Option<Vec<String>>,
+    #[serde(default)]
+    pub encryption_algorithms_client_to_server: Option<Vec<String>>,
+    #[serde(default)]
+    pub encryption_algorithms_server_to_client: Option<Vec<String>>,
+    #[serde(default)]
+    pub mac_algorithms_client_to_server: Option<Vec<String>>,
+    #[serde(default)]
+    pub mac_algorithms_server_to_client: Option<Vec<String>>,
+    #[serde(default)]
+    pub compression_algorithms_client_to_server: Option<Vec<String>>,
+    #[serde(default)]
+    pub compression_algorithms_server_to_client: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FtpFields {

@@ -71,6 +71,9 @@ pub(crate) fn d_sim_rtt_min_ms() -> f64 {
 pub(crate) fn d_sim_rtt_max_ms() -> f64 {
     200.0
 }
+pub(crate) fn d_ssh_client_id() -> String {
+    "SSH-2.0-RiftMap_0.1".into()
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -87,6 +90,32 @@ pub enum Protocol {
 pub struct ServiceConfig {
     pub port: u16,
     pub protocol: Protocol,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SshProbeMode {
+    #[default]
+    PassiveBanner,
+    VersionExchange,
+    KexinitProbe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshConfig {
+    #[serde(default)]
+    pub probe_mode: SshProbeMode,
+    #[serde(default = "d_ssh_client_id")]
+    pub client_id: String,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            probe_mode: SshProbeMode::PassiveBanner,
+            client_id: d_ssh_client_id(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +144,8 @@ pub struct ScanConfig {
     pub banner_queue_capacity: usize,
     #[serde(default)]
     pub max_runtime_secs: Option<u64>,
+    #[serde(default)]
+    pub ssh: SshConfig,
 }
 
 impl ScanConfig {
@@ -313,6 +344,13 @@ impl Config {
         if let Some(max_runtime_secs) = self.scan.max_runtime_secs {
             anyhow::ensure!(max_runtime_secs > 0, "max_runtime_secs must be positive");
         }
+        anyhow::ensure!(
+            self.scan.ssh.client_id.starts_with("SSH-2.0-")
+                && self.scan.ssh.client_id.is_ascii()
+                && !self.scan.ssh.client_id.contains(['\r', '\n'])
+                && self.scan.ssh.client_id.len() <= 253,
+            "scan.ssh.client_id must be an ASCII SSH-2.0 identification string without CR/LF"
+        );
         anyhow::ensure!(self.targets.max_targets > 0, "max_targets must be positive");
         anyhow::ensure!(
             self.network.provider_egress_mbps > 0.0,
@@ -405,6 +443,7 @@ mod tests {
                 banner_connects_per_second: 10,
                 banner_queue_capacity: 128,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: BudgetConfig::default(),
             targets: TargetsConfig {

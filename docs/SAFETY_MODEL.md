@@ -34,14 +34,29 @@ the target safety policy before a job is created.
 
 Raw discovery sends TCP SYN packets only. Banner collection uses ordinary kernel
 TCP connections and waits for passive, server-first banners for the configured
-protocol. RiftMap does not send client protocol data, authentication material,
-exploit payloads, or vulnerability checks.
+protocol by default. RiftMap does not send authentication material, exploit
+payloads, or vulnerability checks.
+
+SSH has an explicit probe mode because active SSH probing changes the service
+log footprint:
+
+- `passive_banner` is the default. RiftMap connects, reads the server
+  identification line, and closes without sending SSH protocol data.
+- `version_exchange` sends the configured client identification string after
+  the server banner, then closes before key exchange.
+- `kexinit_probe` sends the configured client identification string and a
+  minimal SSH KEXINIT packet, reads the server KEXINIT packet when available,
+  records advertised algorithms, and closes before authentication.
+
+Only `passive_banner` is part of the passive inventory model. The other SSH
+probe modes are active application probes and should be used only on explicitly
+authorized targets where pre-authentication connection logs are acceptable.
 
 Current protocol support is intentionally narrow: SSH, FTP, MySQL, SMTP, Redis,
 and Postgres. Redis and Postgres usually do not emit a useful server-first
 banner, so RiftMap only parses unsolicited server data when present. IPv6, UDP,
-TLS handshakes, active application probes, authentication, and vulnerability
-detection are outside the current implementation.
+TLS handshakes, authentication, and vulnerability detection are outside the
+current implementation.
 
 ## Negative results
 
