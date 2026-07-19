@@ -1,37 +1,73 @@
-name: ci
+name: CI
+
 on:
   push:
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   test:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
   aarch64-check:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libpcap-dev
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libpcap-dev
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64
       - env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --target aarch64-unknown-linux-gnu
+          PKG_CONFIG_ALLOW_CROSS: "1"
+        run: cargo check --locked --target aarch64-unknown-linux-gnu
+
   native-netns-smoke:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - run: sudo apt-get update && sudo apt-get install -y libpcap-dev iproute2 python3
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev iproute2 python3
       - uses: dtolnay/rust-toolchain@1.85.0
-      - run: cargo build
-      - run: sudo -E bash scripts/netns-smoke.sh target/debug/riftmap
+      - uses: Swatinem/rust-cache@v2
+      - name: Build debug binary
+        run: cargo build --locked
+      - name: Run isolated network smoke test
+        run: sudo -E bash scripts/netns-smoke.sh target/debug/riftmap

@@ -125,6 +125,10 @@ from `events.ndjson`.
 
 More details:
 
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) describes the development and review
+  workflow.
+- [`docs/CI_CD.md`](docs/CI_CD.md) documents GitHub Actions, branch protection,
+  and tagged releases.
 - [`docs/SAFETY_MODEL.md`](docs/SAFETY_MODEL.md) explains target filtering,
   negative results, and rate-safety assumptions.
 - [`docs/RESULT_SCHEMA.md`](docs/RESULT_SCHEMA.md) documents `events.ndjson`,
@@ -141,8 +145,8 @@ More details:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
 sudo -E bash scripts/netns-smoke.sh target/debug/riftmap
 ```
 

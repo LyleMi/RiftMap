@@ -13,7 +13,7 @@ Postgres 的服务端首个完整消息；不会发送客户端协议数据。
 CI 也包含网络命名空间隔离的 Linux smoke test；投入运行前仍需要更广泛的原生
 Linux 准确性与规模验证。已知差距见 [`KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md)。
 
-MVP 每个任务支持一个 TCP 端口和一种协议，提供确定性随机顺序、最多三轮仅对
+MVP 每个任务支持一个或多个 IPv4 TCP 服务端点，提供确定性随机顺序、最多三轮仅对
 无响应目标重试、mmap 状态、原子 checkpoint、幂等 NDJSON 导出、应用层线速
 估算限速，以及由操作者自行应用的 `tc` 硬限速。实扫要求 Linux 5.10+、
 libpcap、iproute2，以及 root 或等价的 `CAP_NET_RAW`/`CAP_NET_ADMIN` 权限。
@@ -83,6 +83,8 @@ endpoint 子集，并在 `checkpoint.json` 中记录分片元数据。
 
 更多文档：
 
+- [`CONTRIBUTING.md`](CONTRIBUTING.md)：开发、测试与评审流程。
+- [`docs/CI_CD.md`](docs/CI_CD.md)：GitHub Actions、分支保护与标签发布流程。
 - [`docs/SAFETY_MODEL.md`](docs/SAFETY_MODEL.md)：目标过滤、阴性结果和限速安全假设。
 - [`docs/RESULT_SCHEMA.md`](docs/RESULT_SCHEMA.md)：`events.ndjson`、`results.ndjson`
   和 `summary.json` 字段。

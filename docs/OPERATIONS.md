@@ -108,9 +108,10 @@ RiftMap never changes qdisc itself. With `require_tc = true`, a live scan
 refuses to run unless the root qdisc is TBF and its reported rate is at or
 below the configured ceiling.
 
-The `[budget]` section is only for estimates. `time_budget_secs` does not stop
-a scan. Use `scan.max_runtime_secs` when the process needs a protective runtime
-limit.
+`budget.time_budget_secs` is an estimate by default. Set
+`budget.enforce_time_budget = true` to make it a protective timeout, or use
+`scan.max_runtime_secs` for an independent runtime limit. When both are active,
+the smaller limit wins.
 
 ## Interpreting completion
 

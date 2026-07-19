@@ -3,9 +3,11 @@ use base64::Engine;
 use std::{
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 #[cfg(target_os = "linux")]
-use std::{path::Path, process::Command, sync::Arc, time::Duration};
+use std::{path::Path, process::Command};
 
 pub fn resolve_source_ip(cfg: &Config) -> anyhow::Result<Ipv4Addr> {
     if let Some(ip) = cfg.network.source_ip.address() {
@@ -228,6 +230,7 @@ pub fn scan(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> 
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn effective_runtime_limit_secs(cfg: &Config) -> Option<u64> {
     let budget = cfg
         .budget
@@ -242,6 +245,7 @@ fn effective_runtime_limit_secs(cfg: &Config) -> Option<u64> {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn banner_pipeline(
     job_dir: PathBuf,
     receiver: std::sync::mpsc::Receiver<Option<OpenTarget>>,
@@ -294,6 +298,7 @@ async fn banner_pipeline(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn drain_completed_banner_tasks(
     tasks: &mut tokio::task::JoinSet<anyhow::Result<(usize, crate::ResultV1)>>,
     job_dir: &std::path::Path,
@@ -314,6 +319,7 @@ async fn drain_completed_banner_tasks(
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct OpenTarget {
     index: usize,
     ip: Ipv4Addr,
@@ -329,11 +335,13 @@ struct SynObservation {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct AsyncTokenBucket {
     inner: Arc<tokio::sync::Mutex<crate::rate::TokenBucket>>,
     start: std::time::Instant,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl AsyncTokenBucket {
     fn new(bucket: crate::rate::TokenBucket, start: std::time::Instant) -> Self {
         Self {
@@ -361,6 +369,7 @@ struct BannerObservation {
     parsed: Option<crate::protocol::ParsedBanner>,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn inspect_banner(
     scan_id: &str,
     ip: Ipv4Addr,
@@ -401,6 +410,7 @@ async fn inspect_banner(
     Ok(make_result(scan_id, ip, service, syn, observation))
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn connect_banner(
     ip: Ipv4Addr,
     source_ip: Ipv4Addr,
@@ -421,6 +431,7 @@ async fn connect_banner(
     })
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn read_banner(
     stream: &mut tokio::net::TcpStream,
     scan: &crate::config::ScanConfig,
@@ -447,6 +458,7 @@ async fn read_banner(
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn banner_completion(
     scan: &crate::config::ScanConfig,
     service: crate::config::ServiceConfig,
@@ -462,6 +474,7 @@ fn banner_completion(
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn terminal_banner_status(status: crate::BannerStatus) -> bool {
     matches!(
         status,
