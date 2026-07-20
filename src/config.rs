@@ -81,7 +81,7 @@ pub(crate) fn d_sim_rtt_max_ms() -> f64 {
     200.0
 }
 pub(crate) fn d_ssh_client_id() -> String {
-    "SSH-2.0-RiftMap_0.1".into()
+    "SSH-2.0-OpenSSH_9.7p1".into()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

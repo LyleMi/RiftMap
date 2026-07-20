@@ -464,9 +464,9 @@ async fn banner_pipeline(
 ) -> anyhow::Result<()> {
     use tokio::{sync::Semaphore, task::JoinSet, time};
     let sem = Arc::new(Semaphore::new(cfg.scan.banner_concurrency));
-    let mut ticker = time::interval(Duration::from_secs_f64(
+    let base_interval = Duration::from_secs_f64(
         1.0 / f64::from(cfg.scan.banner_connects_per_second),
-    ));
+    );
     let mut tasks = JoinSet::new();
     loop {
         drain_completed_banner_tasks(&mut tasks, &job_dir, &banner_state_file).await?;
@@ -475,7 +475,8 @@ async fn banner_pipeline(
         }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(Some(target)) => {
-                ticker.tick().await;
+                let jitter_factor = 0.7 + (rand::random::<f64>() * 0.6);
+                time::sleep(base_interval.mul_f64(jitter_factor)).await;
                 let permit = sem.clone().acquire_owned().await?;
                 let scan = cfg.scan.clone();
                 let scan_id = scan_id.clone();
@@ -866,30 +867,71 @@ fn build_ssh_kexinit_probe() -> Vec<u8> {
     write_ssh_namelist(
         &mut payload,
         &[
+            "sntrup761x25519-sha512@openssh.com",
             "curve25519-sha256",
             "curve25519-sha256@libssh.org",
             "ecdh-sha2-nistp256",
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
+            "diffie-hellman-group16-sha512",
+            "diffie-hellman-group18-sha512",
             "diffie-hellman-group14-sha256",
         ],
     );
     write_ssh_namelist(
         &mut payload,
         &[
+            "ssh-ed25519-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+            "sk-ssh-ed25519-cert-v01@openssh.com",
+            "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            "rsa-sha2-512-cert-v01@openssh.com",
+            "rsa-sha2-256-cert-v01@openssh.com",
             "ssh-ed25519",
             "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
+            "sk-ssh-ed25519@openssh.com",
+            "sk-ecdsa-sha2-nistp256@openssh.com",
             "rsa-sha2-512",
             "rsa-sha2-256",
-            "ssh-rsa",
         ],
     );
     for _ in 0..2 {
-        write_ssh_namelist(&mut payload, &["aes128-ctr", "aes256-ctr"]);
+        write_ssh_namelist(
+            &mut payload,
+            &[
+                "chacha20-poly1305@openssh.com",
+                "aes128-ctr",
+                "aes192-ctr",
+                "aes256-ctr",
+                "aes128-gcm@openssh.com",
+                "aes256-gcm@openssh.com",
+            ],
+        );
     }
     for _ in 0..2 {
-        write_ssh_namelist(&mut payload, &["hmac-sha2-256", "hmac-sha1"]);
+        write_ssh_namelist(
+            &mut payload,
+            &[
+                "umac-64-etm@openssh.com",
+                "umac-128-etm@openssh.com",
+                "hmac-sha2-256-etm@openssh.com",
+                "hmac-sha2-512-etm@openssh.com",
+                "hmac-sha1-etm@openssh.com",
+                "umac-64@openssh.com",
+                "umac-128@openssh.com",
+                "hmac-sha2-256",
+                "hmac-sha2-512",
+                "hmac-sha1",
+            ],
+        );
     }
     for _ in 0..2 {
-        write_ssh_namelist(&mut payload, &["none"]);
+        write_ssh_namelist(&mut payload, &["none", "zlib@openssh.com"]);
     }
     write_ssh_namelist(&mut payload, &[]);
     write_ssh_namelist(&mut payload, &[]);
@@ -906,7 +948,9 @@ fn build_ssh_kexinit_probe() -> Vec<u8> {
     packet.extend_from_slice(&(packet_len as u32).to_be_bytes());
     packet.push(padding_len as u8);
     packet.extend_from_slice(&payload);
-    packet.extend(std::iter::repeat_n(0, padding_len));
+    let mut padding = vec![0u8; padding_len];
+    rand::fill(&mut padding[..]);
+    packet.extend_from_slice(&padding);
     packet
 }
 
@@ -1353,10 +1397,10 @@ mod simulation {
 
     fn simulated_banner(protocol: crate::Protocol) -> Vec<u8> {
         match protocol {
-            crate::Protocol::Ssh => b"SSH-2.0-RiftMapSim_1.0\r\n".to_vec(),
-            crate::Protocol::Ftp => b"220 riftmap-sim FTP ready\r\n".to_vec(),
+            crate::Protocol::Ssh => b"SSH-2.0-OpenSSH_9.7p1\r\n".to_vec(),
+            crate::Protocol::Ftp => b"220 ftp.example.com FTP ready\r\n".to_vec(),
             crate::Protocol::Mysql => mysql_banner(),
-            crate::Protocol::Smtp => b"220 riftmap-sim ESMTP ready\r\n".to_vec(),
+            crate::Protocol::Smtp => b"220 mail.example.com ESMTP ready\r\n".to_vec(),
             crate::Protocol::Redis => b"+PONG\r\n".to_vec(),
             crate::Protocol::Postgres => postgres_banner(),
         }
@@ -1364,7 +1408,7 @@ mod simulation {
 
     fn mysql_banner() -> Vec<u8> {
         let mut payload = vec![10];
-        payload.extend_from_slice(b"8.0.36-riftmap-sim\0");
+        payload.extend_from_slice(b"8.0.36\0");
         payload.extend_from_slice(&1u32.to_le_bytes());
         payload.extend_from_slice(b"12345678");
         payload.push(0);
@@ -1441,6 +1485,7 @@ mod linux {
         source_port: u16,
         syn_attempts: u8,
         now_ms: u32,
+        nonce: u32,
     }
 
     fn local_source_port(
@@ -1449,9 +1494,10 @@ mod linux {
         src: Ipv4Addr,
         dst: Ipv4Addr,
         dest_port: u16,
+        nonce: u32,
     ) -> u16 {
         if configured == 0 {
-            packet::ephemeral_source_port(secret, src, dst, dest_port)
+            packet::ephemeral_source_port(secret, src, dst, dest_port, nonce)
         } else {
             configured
         }
@@ -1517,6 +1563,7 @@ mod linux {
             context.src,
             remote,
             source_port,
+            context.nonce,
         );
         let cookie = packet::syn_cookie(
             context.secret,
@@ -1672,6 +1719,7 @@ mod linux {
             context.src,
             reply.remote,
             reply.dest_port,
+            context.nonce,
         );
         let cookie = packet::syn_cookie(
             context.secret,
@@ -1706,6 +1754,7 @@ mod linux {
         mss: u16,
         timestamp_base: u32,
         timed_out: Arc<AtomicBool>,
+        ip_id_counter: u32,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1757,7 +1806,16 @@ mod linux {
         handle: thread::JoinHandle<anyhow::Result<()>>,
     }
 
-    const SENDMMSG_BATCH: usize = 64;
+    const SENDMMSG_BATCH_MIN: usize = 32;
+    const SENDMMSG_BATCH_RANGE: usize = 65;
+
+    fn batch_size(secret: &[u8; 32], order: u64) -> usize {
+        let mut h = blake3::Hasher::new_keyed(secret);
+        h.update(b"batch-size");
+        h.update(&order.to_le_bytes());
+        let sample = h.finalize().as_bytes()[0] as usize;
+        SENDMMSG_BATCH_MIN + (sample % SENDMMSG_BATCH_RANGE)
+    }
 
     fn scan_runtime(job: &PreparedJob, cfg: &Config) -> anyhow::Result<ScanRuntime> {
         let source_ip = resolve_source_ip(cfg)?;
@@ -1798,6 +1856,7 @@ mod linux {
             mss,
             timestamp_base,
             timed_out,
+            ip_id_counter: 0,
         })
     }
 
@@ -2036,8 +2095,9 @@ mod linux {
         runtime: &mut ScanRuntime,
         buffers: &mut ScanBuffers<'_>,
     ) -> Vec<PreparedSyn> {
-        let mut batch = Vec::with_capacity(SENDMMSG_BATCH);
-        while *order < buffers.states.len() as u64 && batch.len() < SENDMMSG_BATCH {
+        let current_batch_size = batch_size(&runtime.seed, *order);
+        let mut batch = Vec::with_capacity(current_batch_size);
+        while *order < buffers.states.len() as u64 && batch.len() < current_batch_size {
             let current_order = *order;
             let idx = runtime.perm.get(current_order) as usize;
             if state_rank(buffers.states[idx]) != crate::TargetState::NoResponse.rank() {
@@ -2052,6 +2112,7 @@ mod linux {
                 runtime.source_ip,
                 ip,
                 service.port,
+                runtime.timestamp_base,
             );
             if !runtime
                 .limiter
@@ -2068,6 +2129,13 @@ mod linux {
                 source_port,
                 service.port,
             );
+            runtime.ip_id_counter = runtime.ip_id_counter.wrapping_add(1);
+            let ip_id = packet::ip_identification(
+                &runtime.seed,
+                runtime.source_ip,
+                ip,
+                runtime.ip_id_counter,
+            );
             batch.push(PreparedSyn {
                 ip,
                 port: service.port,
@@ -2083,7 +2151,9 @@ mod linux {
                     window_scale: cfg.scan.syn_window_scale,
                     timestamp_value: runtime
                         .timestamp_base
-                        .wrapping_add(elapsed_ms(runtime.start)),
+                        .wrapping_add(elapsed_ms(runtime.start))
+                        .wrapping_add(packet::timestamp_jitter(&runtime.seed, ip)),
+                    ip_id,
                 }
                 .encode(),
             });
@@ -2156,13 +2226,22 @@ mod linux {
         }
     }
 
+    fn round_pause_ms(secret: &[u8; 32], round: u8) -> u64 {
+        let mut h = blake3::Hasher::new_keyed(secret);
+        h.update(b"round-pause");
+        h.update(&[round]);
+        let sample = u16::from_be_bytes(h.finalize().as_bytes()[..2].try_into().unwrap());
+        800 + (sample as u64 % 701)
+    }
+
     fn pause_between_rounds(
         cfg: &Config,
         runtime: &mut ScanRuntime,
         buffers: &mut ScanBuffers<'_>,
         syn_attempts: u8,
     ) {
-        thread::sleep(Duration::from_secs(1));
+        let pause = Duration::from_millis(round_pause_ms(&runtime.seed, syn_attempts));
+        thread::sleep(pause);
         receive_replies(cfg, runtime, buffers, syn_attempts);
     }
 
@@ -2187,6 +2266,7 @@ mod linux {
             source_port: cfg.scan.source_port,
             syn_attempts,
             now_ms: elapsed_ms(runtime.start),
+            nonce: runtime.timestamp_base,
         };
         receive(&mut runtime.cap, &mut context);
     }
@@ -2623,6 +2703,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
@@ -2638,7 +2719,7 @@ mod linux {
             let secret = [7; 32];
             let mut scan = scan_config();
             scan.source_port = 0;
-            let source_port = local_source_port(scan.source_port, &secret, src, remote, scan.port);
+            let source_port = local_source_port(scan.source_port, &secret, src, remote, scan.port, 0);
             let cookie = packet::syn_cookie(&secret, src, remote, source_port, scan.port);
             let tcp = tcp_segment(scan.port, source_port, 0, cookie.wrapping_add(1), 0x12);
             let packet = ethernet_ipv4(ipv4_packet(6, remote, src, &tcp));
@@ -2666,6 +2747,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
@@ -2707,6 +2789,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
@@ -2748,6 +2831,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
@@ -2800,6 +2884,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&syn_ack, syn_offset, syn_ihl, &mut context);
@@ -2848,6 +2933,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_icmp_reply(&packet, offset, ihl, &mut context);

@@ -1207,10 +1207,10 @@ fn hash_unit(cfg: &Config, scan_id: &str, endpoint: Endpoint, domain: &[u8]) -> 
 
 fn simulated_banner(protocol: Protocol) -> Vec<u8> {
     match protocol {
-        Protocol::Ssh => b"SSH-2.0-RiftMapSim_1.0\r\n".to_vec(),
-        Protocol::Ftp => b"220 riftmap-sim FTP ready\r\n".to_vec(),
+        Protocol::Ssh => b"SSH-2.0-OpenSSH_9.7p1\r\n".to_vec(),
+        Protocol::Ftp => b"220 ftp.example.com FTP ready\r\n".to_vec(),
         Protocol::Mysql => mysql_banner(),
-        Protocol::Smtp => b"220 riftmap-sim ESMTP ready\r\n".to_vec(),
+        Protocol::Smtp => b"220 mail.example.com ESMTP ready\r\n".to_vec(),
         Protocol::Redis => b"+PONG\r\n".to_vec(),
         Protocol::Postgres => postgres_banner(),
     }
@@ -1218,7 +1218,7 @@ fn simulated_banner(protocol: Protocol) -> Vec<u8> {
 
 fn mysql_banner() -> Vec<u8> {
     let mut payload = vec![10];
-    payload.extend_from_slice(b"8.0.36-riftmap-sim\0");
+    payload.extend_from_slice(b"8.0.36\0");
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(b"12345678");
     payload.push(0);

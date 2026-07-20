@@ -34,7 +34,7 @@ banner_queue_capacity = 8192
 # kexinit_probe sends client_id plus a minimal KEXINIT packet and records the
 # server's advertised SSH algorithms when available.
 probe_mode = "passive_banner"
-client_id = "SSH-2.0-RiftMap_0.1"
+client_id = "SSH-2.0-OpenSSH_9.7p1"
 
 [budget]
 # Optional estimation inputs for large jobs.

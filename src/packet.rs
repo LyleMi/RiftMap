@@ -29,15 +29,34 @@ pub fn ephemeral_source_port(
     src: Ipv4Addr,
     dst: Ipv4Addr,
     dest_port: u16,
+    nonce: u32,
 ) -> u16 {
     let mut h = blake3::Hasher::new_keyed(secret);
     h.update(b"source-port");
     h.update(&src.octets());
     h.update(&dst.octets());
     h.update(&dest_port.to_be_bytes());
+    h.update(&nonce.to_le_bytes());
     let sample = u16::from_be_bytes(h.finalize().as_bytes()[..2].try_into().unwrap());
     let span = LINUX_EPHEMERAL_LAST - LINUX_EPHEMERAL_FIRST + 1;
     LINUX_EPHEMERAL_FIRST + (sample % span)
+}
+
+pub fn timestamp_jitter(secret: &[u8; 32], dst: Ipv4Addr) -> u32 {
+    let mut h = blake3::Hasher::new_keyed(secret);
+    h.update(b"ts-jitter");
+    h.update(&dst.octets());
+    let sample = u32::from_be_bytes(h.finalize().as_bytes()[..4].try_into().unwrap());
+    sample % 5000
+}
+
+pub fn ip_identification(secret: &[u8; 32], src: Ipv4Addr, dst: Ipv4Addr, counter: u32) -> u16 {
+    let mut h = blake3::Hasher::new_keyed(secret);
+    h.update(b"ip-id");
+    h.update(&src.octets());
+    h.update(&dst.octets());
+    let base = u16::from_be_bytes(h.finalize().as_bytes()[..2].try_into().unwrap());
+    base.wrapping_add(counter as u16)
 }
 
 pub fn checksum(data: &[u8]) -> u16 {
@@ -66,6 +85,7 @@ pub struct SynPacket {
     pub window_size: u16,
     pub window_scale: u8,
     pub timestamp_value: u32,
+    pub ip_id: u16,
 }
 
 impl SynPacket {
@@ -97,6 +117,7 @@ impl SynPacket {
         let mut p = vec![0u8; total];
         p[0] = 0x45;
         p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[4..6].copy_from_slice(&self.ip_id.to_be_bytes());
         p[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
         p[8] = self.ttl;
         p[9] = 6;
@@ -140,10 +161,12 @@ mod tests {
             window_size: 64240,
             window_scale: 7,
             timestamp_value: 1234,
+            ip_id: 0xAB12,
         }
         .encode();
         assert_eq!(p.len(), 60);
         assert_eq!(p[8], 64);
+        assert_eq!(u16::from_be_bytes(p[4..6].try_into().unwrap()), 0xAB12);
         assert_eq!(u16::from_be_bytes(p[34..36].try_into().unwrap()), 64240);
         assert_eq!(p[56], 1);
         assert_eq!(p[57], 3);
@@ -164,10 +187,12 @@ mod tests {
         let src = "192.0.2.1".parse().unwrap();
         let dst = "198.51.100.2".parse().unwrap();
 
-        let port = ephemeral_source_port(&secret, src, dst, 22);
+        let port = ephemeral_source_port(&secret, src, dst, 22, 0);
 
         assert!((32768..=60999).contains(&port));
-        assert_eq!(port, ephemeral_source_port(&secret, src, dst, 22));
+        assert_eq!(port, ephemeral_source_port(&secret, src, dst, 22, 0));
+        // Different nonce produces different port
+        assert_ne!(port, ephemeral_source_port(&secret, src, dst, 22, 1));
     }
     #[test]
     fn ack_wraps() {
