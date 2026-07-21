@@ -3,8 +3,8 @@ use std::net::Ipv4Addr;
 // 60-byte IPv4/TCP SYN (including Linux-style options) plus Ethernet/FCS/preamble/IFG.
 pub const SYN_WIRE_BYTES: u64 = 98;
 
-const LINUX_EPHEMERAL_FIRST: u16 = 32768;
-const LINUX_EPHEMERAL_LAST: u16 = 60999;
+pub const LINUX_EPHEMERAL_FIRST: u16 = 32768;
+pub const LINUX_EPHEMERAL_LAST: u16 = 60999;
 
 pub fn syn_cookie(
     secret: &[u8; 32],

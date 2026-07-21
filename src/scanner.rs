@@ -467,6 +467,8 @@ async fn banner_pipeline(
     let base_interval = Duration::from_secs_f64(
         1.0 / f64::from(cfg.scan.banner_connects_per_second),
     );
+    let mut ticker = time::interval(base_interval);
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut tasks = JoinSet::new();
     loop {
         drain_completed_banner_tasks(&mut tasks, &job_dir, &banner_state_file).await?;
@@ -475,8 +477,11 @@ async fn banner_pipeline(
         }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(Some(target)) => {
-                let jitter_factor = 0.7 + (rand::random::<f64>() * 0.6);
-                time::sleep(base_interval.mul_f64(jitter_factor)).await;
+                ticker.tick().await;
+                let jitter = Duration::from_secs_f64(
+                    base_interval.as_secs_f64() * (rand::random::<f64>() * 0.3 - 0.15),
+                );
+                time::sleep(jitter).await;
                 let permit = sem.clone().acquire_owned().await?;
                 let scan = cfg.scan.clone();
                 let scan_id = scan_id.clone();
@@ -1822,7 +1827,7 @@ mod linux {
         verify_rate_limit(cfg)?;
         let seed = crate::job::decode_seed(&job.meta.seed_hex)?;
         let perm = Permutation::new(job.meta.target_count, seed)?;
-        let cap = capture_socket(cfg)?;
+        let cap = capture_socket(cfg, source_ip)?;
         let raw = raw_socket(cfg)?;
         let tx_start = interface_tx_stats(Path::new("/sys/class/net"), &cfg.network.interface)
             .context("read starting interface TX counters")?;
@@ -1867,17 +1872,17 @@ mod linux {
         Ok(())
     }
 
-    fn capture_socket(cfg: &Config) -> anyhow::Result<pcap::Capture<pcap::Active>> {
+    fn capture_socket(cfg: &Config, source_ip: Ipv4Addr) -> anyhow::Result<pcap::Capture<pcap::Active>> {
         let mut cap = pcap::Capture::from_device(cfg.network.interface.as_str())?
             .promisc(false)
             .immediate_mode(true)
             .timeout(1)
             .open()?;
-        cap.filter(&capture_filter(cfg), true)?;
+        cap.filter(&capture_filter(cfg, source_ip), true)?;
         Ok(cap.setnonblock()?)
     }
 
-    fn capture_filter(cfg: &Config) -> String {
+    fn capture_filter(cfg: &Config, source_ip: Ipv4Addr) -> String {
         let services = cfg.scan.services();
         let tcp_ports = services
             .iter()
@@ -1885,7 +1890,12 @@ mod linux {
             .collect::<Vec<_>>()
             .join(" or ");
         let tcp = if cfg.scan.source_port == 0 {
-            format!("tcp and ({tcp_ports})")
+            format!(
+                "tcp and dst host {} and ({tcp_ports}) and dst portrange {}-{}",
+                source_ip,
+                packet::LINUX_EPHEMERAL_FIRST,
+                packet::LINUX_EPHEMERAL_LAST
+            )
         } else {
             format!(
                 "tcp and ({tcp_ports}) and dst port {}",
@@ -2231,7 +2241,7 @@ mod linux {
         h.update(b"round-pause");
         h.update(&[round]);
         let sample = u16::from_be_bytes(h.finalize().as_bytes()[..2].try_into().unwrap());
-        800 + (sample as u64 % 701)
+        1000 + (sample as u64 % 501)
     }
 
     fn pause_between_rounds(
@@ -2610,8 +2620,8 @@ mod linux {
             ];
 
             assert_eq!(
-                capture_filter(&cfg),
-                "(tcp and (src port 22 or src port 25)) or icmp"
+                capture_filter(&cfg, "192.0.2.10".parse().unwrap()),
+                "(tcp and dst host 192.0.2.10 and (src port 22 or src port 25) and dst portrange 32768-60999) or icmp"
             );
         }
 
