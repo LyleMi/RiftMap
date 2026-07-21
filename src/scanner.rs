@@ -479,7 +479,7 @@ async fn banner_pipeline(
             Ok(Some(target)) => {
                 ticker.tick().await;
                 let jitter = Duration::from_secs_f64(
-                    base_interval.as_secs_f64() * (rand::random::<f64>() * 0.3 - 0.15),
+                    base_interval.as_secs_f64() * rand::random::<f64>() * 0.3,
                 );
                 time::sleep(jitter).await;
                 let permit = sem.clone().acquire_owned().await?;
