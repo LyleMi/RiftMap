@@ -466,9 +466,8 @@ async fn banner_pipeline(
 ) -> anyhow::Result<()> {
     use tokio::{sync::Semaphore, task::JoinSet, time};
     let sem = Arc::new(Semaphore::new(cfg.scan.banner_concurrency));
-    let base_interval = Duration::from_secs_f64(
-        1.0 / f64::from(cfg.scan.banner_connects_per_second),
-    );
+    let base_interval =
+        Duration::from_secs_f64(1.0 / f64::from(cfg.scan.banner_connects_per_second));
     let mut ticker = time::interval(base_interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut tasks = JoinSet::new();
@@ -1885,7 +1884,10 @@ mod linux {
         Ok(())
     }
 
-    fn capture_socket(cfg: &Config, source_ip: Ipv4Addr) -> anyhow::Result<pcap::Capture<pcap::Active>> {
+    fn capture_socket(
+        cfg: &Config,
+        source_ip: Ipv4Addr,
+    ) -> anyhow::Result<pcap::Capture<pcap::Active>> {
         let mut cap = pcap::Capture::from_device(cfg.network.interface.as_str())?
             .promisc(false)
             .immediate_mode(true)
@@ -2742,7 +2744,8 @@ mod linux {
             let secret = [7; 32];
             let mut scan = scan_config();
             scan.source_port = 0;
-            let source_port = local_source_port(scan.source_port, &secret, src, remote, scan.port, 0);
+            let source_port =
+                local_source_port(scan.source_port, &secret, src, remote, scan.port, 0);
             let cookie = packet::syn_cookie(&secret, src, remote, source_port, scan.port);
             let tcp = tcp_segment(scan.port, source_port, 0, cookie.wrapping_add(1), 0x12);
             let packet = ethernet_ipv4(ipv4_packet(6, remote, src, &tcp));
