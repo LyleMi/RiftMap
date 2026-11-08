@@ -760,12 +760,10 @@ async fn inspect_banner(
             {
                 ssh.probe_mode = Some(ssh_probe_mode_name(scan.ssh.probe_mode).into());
             }
-            if observation.status == crate::BannerStatus::Ok {
+            if observation.status == crate::BannerStatus::Ok
+                || terminal_banner_status(observation.status)
+            {
                 break;
-            } else {
-                if terminal_banner_status(observation.status) {
-                    break;
-                }
             }
         }
         if terminal_banner_status(observation.status) {
