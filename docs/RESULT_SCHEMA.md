@@ -43,7 +43,10 @@ Banner fields:
   `protocol_mismatch`, or `oversized`.
 - `banner_base64`: raw captured banner bytes encoded as base64 when present.
 - `banner_text`: parsed text for text protocols when available.
-- `ssh`: SSH-specific parsed fields.
+- `ssh`: SSH-specific parsed fields. Passive mode records the server
+  identification fields. When `scan.ssh.probe_mode = "kexinit_probe"` is
+  configured, this may also include the server's advertised KEX, host-key,
+  cipher, MAC, and compression algorithm lists.
 - `ftp`: FTP-specific parsed fields.
 - `mysql`: MySQL-specific parsed fields.
 - `smtp`: SMTP-specific parsed fields.

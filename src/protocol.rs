@@ -12,6 +12,18 @@ pub struct ParsedBanner {
     pub postgres: Option<PostgresFields>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshKexInit {
+    pub kex_algorithms: Vec<String>,
+    pub server_host_key_algorithms: Vec<String>,
+    pub encryption_algorithms_client_to_server: Vec<String>,
+    pub encryption_algorithms_server_to_client: Vec<String>,
+    pub mac_algorithms_client_to_server: Vec<String>,
+    pub mac_algorithms_server_to_client: Vec<String>,
+    pub compression_algorithms_client_to_server: Vec<String>,
+    pub compression_algorithms_server_to_client: Vec<String>,
+}
+
 pub fn message_len(
     protocol: Protocol,
     data: &[u8],
@@ -163,6 +175,9 @@ pub fn parse(protocol: Protocol, data: &[u8]) -> Result<ParsedBanner, BannerStat
                     protocol_version: Some(proto.into()),
                     software_version: Some(software.into()),
                     comments,
+                    implementation: ssh_implementation(software).map(str::to_owned),
+                    implementation_version: ssh_implementation_version(software).map(str::to_owned),
+                    ..Default::default()
                 }),
                 ..Default::default()
             })
@@ -185,6 +200,96 @@ pub fn parse(protocol: Protocol, data: &[u8]) -> Result<ParsedBanner, BannerStat
         Protocol::Redis => parse_redis(data),
         Protocol::Postgres => parse_postgres(data),
     }
+}
+
+fn ssh_implementation(software: &str) -> Option<&str> {
+    let prefixes = [
+        "OpenSSH",
+        "Dropbear",
+        "libssh",
+        "Cisco",
+        "RomSShell",
+        "PuTTY",
+        "AsyncSSH",
+    ];
+    prefixes
+        .iter()
+        .copied()
+        .find(|prefix| software.starts_with(prefix))
+}
+
+fn ssh_implementation_version(software: &str) -> Option<&str> {
+    let implementation = ssh_implementation(software)?;
+    software
+        .strip_prefix(implementation)
+        .and_then(|rest| rest.strip_prefix('_').or_else(|| rest.strip_prefix('-')))
+        .filter(|version| !version.is_empty())
+}
+
+pub fn parse_ssh_kexinit_packet(data: &[u8]) -> Result<SshKexInit, BannerStatus> {
+    let payload = ssh_packet_payload(data)?;
+    if payload.first() != Some(&20) {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    if payload.len() < 17 {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    let mut cursor = 17;
+    let kex_algorithms = read_ssh_namelist(payload, &mut cursor)?;
+    let server_host_key_algorithms = read_ssh_namelist(payload, &mut cursor)?;
+    let encryption_algorithms_client_to_server = read_ssh_namelist(payload, &mut cursor)?;
+    let encryption_algorithms_server_to_client = read_ssh_namelist(payload, &mut cursor)?;
+    let mac_algorithms_client_to_server = read_ssh_namelist(payload, &mut cursor)?;
+    let mac_algorithms_server_to_client = read_ssh_namelist(payload, &mut cursor)?;
+    let compression_algorithms_client_to_server = read_ssh_namelist(payload, &mut cursor)?;
+    let compression_algorithms_server_to_client = read_ssh_namelist(payload, &mut cursor)?;
+    let _languages_client_to_server = read_ssh_namelist(payload, &mut cursor)?;
+    let _languages_server_to_client = read_ssh_namelist(payload, &mut cursor)?;
+    if payload.len().saturating_sub(cursor) < 5 {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    Ok(SshKexInit {
+        kex_algorithms,
+        server_host_key_algorithms,
+        encryption_algorithms_client_to_server,
+        encryption_algorithms_server_to_client,
+        mac_algorithms_client_to_server,
+        mac_algorithms_server_to_client,
+        compression_algorithms_client_to_server,
+        compression_algorithms_server_to_client,
+    })
+}
+
+fn ssh_packet_payload(data: &[u8]) -> Result<&[u8], BannerStatus> {
+    if data.len() < 5 {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    let packet_len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+    let padding_len = data[4] as usize;
+    let total = packet_len.checked_add(4).ok_or(BannerStatus::Oversized)?;
+    if total != data.len() || packet_len < padding_len + 1 {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    let payload_len = packet_len - padding_len - 1;
+    Ok(&data[5..5 + payload_len])
+}
+
+fn read_ssh_namelist(data: &[u8], cursor: &mut usize) -> Result<Vec<String>, BannerStatus> {
+    if data.len().saturating_sub(*cursor) < 4 {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    let len = u32::from_be_bytes(data[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    *cursor += 4;
+    if data.len().saturating_sub(*cursor) < len {
+        return Err(BannerStatus::ProtocolMismatch);
+    }
+    let raw = &data[*cursor..*cursor + len];
+    *cursor += len;
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = std::str::from_utf8(raw).map_err(|_| BannerStatus::ProtocolMismatch)?;
+    Ok(text.split(',').map(ToOwned::to_owned).collect())
 }
 
 fn parse_mysql(data: &[u8]) -> Result<ParsedBanner, BannerStatus> {
@@ -312,15 +417,52 @@ mod tests {
         assert_eq!(message_len(Protocol::Ssh, b"SSH-2.0-x", 99).unwrap(), None);
         let b = b"SSH-2.0-OpenSSH_9.0 hello\r\n";
         assert_eq!(message_len(Protocol::Ssh, b, 99).unwrap(), Some(b.len()));
-        assert_eq!(
-            parse(Protocol::Ssh, b)
-                .unwrap()
-                .ssh
-                .unwrap()
-                .software_version
-                .as_deref(),
-            Some("OpenSSH_9.0")
+        let ssh = parse(Protocol::Ssh, b).unwrap().ssh.unwrap();
+        assert_eq!(ssh.software_version.as_deref(), Some("OpenSSH_9.0"));
+        assert_eq!(ssh.implementation.as_deref(), Some("OpenSSH"));
+        assert_eq!(ssh.implementation_version.as_deref(), Some("9.0"));
+    }
+
+    #[test]
+    fn ssh_kexinit_packet_parses_algorithm_lists() {
+        let mut payload = vec![20];
+        payload.extend_from_slice(&[7; 16]);
+        test_namelist(
+            &mut payload,
+            "curve25519-sha256,diffie-hellman-group14-sha256",
         );
+        test_namelist(&mut payload, "ssh-ed25519,rsa-sha2-256");
+        test_namelist(&mut payload, "aes128-ctr");
+        test_namelist(&mut payload, "aes256-ctr");
+        test_namelist(&mut payload, "hmac-sha2-256");
+        test_namelist(&mut payload, "hmac-sha1");
+        test_namelist(&mut payload, "none");
+        test_namelist(&mut payload, "zlib@openssh.com,none");
+        test_namelist(&mut payload, "");
+        test_namelist(&mut payload, "");
+        payload.push(0);
+        payload.extend_from_slice(&0u32.to_be_bytes());
+
+        let padding_len = 4usize;
+        let packet_len = payload.len() + padding_len + 1;
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&(packet_len as u32).to_be_bytes());
+        packet.push(padding_len as u8);
+        packet.extend_from_slice(&payload);
+        packet.extend_from_slice(&[0; 4]);
+
+        let kex = parse_ssh_kexinit_packet(&packet).unwrap();
+        assert_eq!(kex.kex_algorithms[0], "curve25519-sha256");
+        assert_eq!(kex.server_host_key_algorithms[1], "rsa-sha2-256");
+        assert_eq!(
+            kex.compression_algorithms_server_to_client,
+            vec!["zlib@openssh.com", "none"]
+        );
+    }
+
+    fn test_namelist(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
     }
     #[test]
     fn ftp_multiline() {

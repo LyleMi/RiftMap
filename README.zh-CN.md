@@ -61,6 +61,10 @@ riftmap job prune -c config.local.toml --older-than-days 30 --dry-run
 不能把无响应当成可靠的阴性结论。`budget.enforce_time_budget=true` 会让扫描在
 `time_budget_secs` 到达时保护性停止；也可以用 `scan.max_runtime_secs` 设置独立
 运行时上限。
+如需在实扫过程中动态调整应用层限速，可设置
+`network.dynamic_application_mbps_file` 指向一个本地控制文件；文件内容为正数
+Mbps，例如 `40`。RiftMap 会在扫描期间轮询该文件，文件缺失、为空或正在被改写时
+保留上一次有效速率。该机制只调整应用 token bucket，不会修改主机 `tc` qdisc。
 
 任务目录保存不可变配置、随机 seed、目标摘要、网络序 endpoint 文件
 `targets.bin`、`ports.bin`、`protocols.bin`、每 endpoint 一字节的 `state.bin`

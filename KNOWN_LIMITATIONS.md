@@ -10,8 +10,10 @@ is implemented, but production use still needs broader native-Linux proof:
   still uses passive, server-first banner collection.
 - Shards are created and run explicitly. Cross-host scheduling, coordination,
   and result merging are not implemented.
-- IPv6, UDP, TLS handshakes, authentication, active probes, and vulnerability
-  detection are outside the current safety and traffic model.
+- IPv6, UDP, TLS handshakes, authentication, non-SSH active probes, and
+  vulnerability detection are outside the current safety and traffic model.
+  SSH `version_exchange` and `kexinit_probe` are available only as explicit
+  active probe modes; the default remains passive banner collection.
 
 Do not use the current raw scanner against external networks. Continue
 development with namespace-isolated synthetic services and explicitly

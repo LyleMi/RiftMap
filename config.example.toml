@@ -10,7 +10,13 @@ protocol = "ssh"
 #   { port = 3306, protocol = "mysql" },
 # ]
 syn_attempts = 3
-source_port = 61000
+# Raw SYN probe shape. source_port = 0 chooses a stable per-target port from
+# Linux's default ephemeral range; set a non-zero value only for legacy fixed
+# port behavior.
+source_port = 0
+syn_ttl = 64
+syn_window_size = 64240
+syn_window_scale = 7
 connect_timeout_ms = 3000
 banner_timeout_ms = 5000
 banner_max_bytes = 4096
@@ -20,6 +26,15 @@ banner_connects_per_second = 200
 banner_queue_capacity = 8192
 # Optional protection only; time budgets below are for estimation and do not stop scans.
 # max_runtime_secs = 86400
+
+[scan.ssh]
+# passive_banner keeps the original safety model: connect, read the server
+# identification line, and close without sending SSH protocol data.
+# version_exchange additionally sends client_id after the server banner.
+# kexinit_probe sends client_id plus a minimal KEXINIT packet and records the
+# server's advertised SSH algorithms when available.
+probe_mode = "passive_banner"
+client_id = "SSH-2.0-OpenSSH_9.7p1"
 
 [budget]
 # Optional estimation inputs for large jobs.
@@ -39,6 +54,9 @@ interface = "eth0"
 source_ip = "auto"
 provider_egress_mbps = 100
 application_ratio = 0.80
+# Optional live override for application pacing. The file content is a positive
+# Mbps value, for example "40"; invalid or partial writes keep the last value.
+# dynamic_application_mbps_file = ".riftmap/application-mbps"
 tc_ratio = 0.85
 require_tc = true
 accounting = "estimated-wire"

@@ -9,7 +9,16 @@ pub(crate) fn d_syn_attempts() -> u8 {
     3
 }
 pub(crate) fn d_source_port() -> u16 {
-    61000
+    0
+}
+pub(crate) fn d_syn_ttl() -> u8 {
+    64
+}
+pub(crate) fn d_syn_window_size() -> u16 {
+    64240
+}
+pub(crate) fn d_syn_window_scale() -> u8 {
+    7
 }
 pub(crate) fn d_connect_timeout() -> u64 {
     3000
@@ -71,6 +80,9 @@ pub(crate) fn d_sim_rtt_min_ms() -> f64 {
 pub(crate) fn d_sim_rtt_max_ms() -> f64 {
     200.0
 }
+pub(crate) fn d_ssh_client_id() -> String {
+    "SSH-2.0-OpenSSH_9.7p1".into()
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -89,6 +101,32 @@ pub struct ServiceConfig {
     pub protocol: Protocol,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SshProbeMode {
+    #[default]
+    PassiveBanner,
+    VersionExchange,
+    KexinitProbe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshConfig {
+    #[serde(default)]
+    pub probe_mode: SshProbeMode,
+    #[serde(default = "d_ssh_client_id")]
+    pub client_id: String,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            probe_mode: SshProbeMode::PassiveBanner,
+            client_id: d_ssh_client_id(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanConfig {
     pub port: u16,
@@ -99,6 +137,12 @@ pub struct ScanConfig {
     pub syn_attempts: u8,
     #[serde(default = "d_source_port")]
     pub source_port: u16,
+    #[serde(default = "d_syn_ttl")]
+    pub syn_ttl: u8,
+    #[serde(default = "d_syn_window_size")]
+    pub syn_window_size: u16,
+    #[serde(default = "d_syn_window_scale")]
+    pub syn_window_scale: u8,
     #[serde(default = "d_connect_timeout")]
     pub connect_timeout_ms: u64,
     #[serde(default = "d_banner_timeout")]
@@ -115,6 +159,8 @@ pub struct ScanConfig {
     pub banner_queue_capacity: usize,
     #[serde(default)]
     pub max_runtime_secs: Option<u64>,
+    #[serde(default)]
+    pub ssh: SshConfig,
 }
 
 impl ScanConfig {
@@ -175,6 +221,8 @@ pub struct NetworkConfig {
     pub provider_egress_mbps: f64,
     #[serde(default = "d_app_ratio")]
     pub application_ratio: f64,
+    #[serde(default)]
+    pub dynamic_application_mbps_file: Option<PathBuf>,
     #[serde(default = "d_tc_ratio")]
     pub tc_ratio: f64,
     #[serde(default = "d_require_tc")]
@@ -261,6 +309,11 @@ impl Config {
         if cfg.output.job_root.is_relative() {
             cfg.output.job_root = base.join(&cfg.output.job_root);
         }
+        if let Some(path) = &mut cfg.network.dynamic_application_mbps_file {
+            if path.is_relative() {
+                *path = base.join(&*path);
+            }
+        }
         cfg.validate()?;
         // Avoid retaining toml internals containing accidental future secrets.
         value = toml::Value::Table(Default::default());
@@ -268,7 +321,15 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.scan.source_port != 0, "source_port must be non-zero");
+        anyhow::ensure!(self.scan.syn_ttl != 0, "syn_ttl must be non-zero");
+        anyhow::ensure!(
+            self.scan.syn_window_size != 0,
+            "syn_window_size must be non-zero"
+        );
+        anyhow::ensure!(
+            self.scan.syn_window_scale <= 14,
+            "syn_window_scale must be <= 14"
+        );
         let services = self.scan.services();
         anyhow::ensure!(
             !services.is_empty(),
@@ -306,6 +367,13 @@ impl Config {
         if let Some(max_runtime_secs) = self.scan.max_runtime_secs {
             anyhow::ensure!(max_runtime_secs > 0, "max_runtime_secs must be positive");
         }
+        anyhow::ensure!(
+            self.scan.ssh.client_id.starts_with("SSH-2.0-")
+                && self.scan.ssh.client_id.is_ascii()
+                && !self.scan.ssh.client_id.contains(['\r', '\n'])
+                && self.scan.ssh.client_id.len() <= 253,
+            "scan.ssh.client_id must be an ASCII SSH-2.0 identification string without CR/LF"
+        );
         anyhow::ensure!(self.targets.max_targets > 0, "max_targets must be positive");
         anyhow::ensure!(
             self.network.provider_egress_mbps > 0.0,
@@ -315,6 +383,12 @@ impl Config {
             (0.0..=1.0).contains(&self.network.application_ratio),
             "application_ratio must be in 0..=1"
         );
+        if let Some(path) = &self.network.dynamic_application_mbps_file {
+            anyhow::ensure!(
+                !path.as_os_str().is_empty(),
+                "dynamic_application_mbps_file must not be empty"
+            );
+        }
         anyhow::ensure!(
             (0.0..=1.0).contains(&self.network.tc_ratio),
             "tc_ratio must be in 0..=1"
@@ -384,6 +458,9 @@ mod tests {
                 services: vec![],
                 syn_attempts: 3,
                 source_port: 61_000,
+                syn_ttl: d_syn_ttl(),
+                syn_window_size: d_syn_window_size(),
+                syn_window_scale: d_syn_window_scale(),
                 connect_timeout_ms: 3_000,
                 banner_timeout_ms: 5_000,
                 banner_max_bytes: 4_096,
@@ -392,6 +469,7 @@ mod tests {
                 banner_connects_per_second: 10,
                 banner_queue_capacity: 128,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: BudgetConfig::default(),
             targets: TargetsConfig {
@@ -405,6 +483,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),

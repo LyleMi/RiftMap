@@ -104,6 +104,11 @@ RiftMap has two layers of rate control:
 - The `tc-template` command prints a TBF qdisc ceiling using
   `provider_egress_mbps * tc_ratio`.
 
+Set `network.dynamic_application_mbps_file` when the application pacing limit
+must be adjusted while a scan is running. The file content is a positive Mbps
+value, for example `40`. RiftMap polls the file during scanning and keeps the
+last valid rate when the file is missing or contains a partial write.
+
 RiftMap never changes qdisc itself. With `require_tc = true`, a live scan
 refuses to run unless the root qdisc is TBF and its reported rate is at or
 below the configured ceiling.
@@ -159,8 +164,9 @@ Full export is refused when:
 
 ## Troubleshooting
 
-- `source port ... unavailable`: another local process is bound to
-  `scan.source_port`; change the source port or stop that process.
+- `source port ... unavailable`: another local process is bound to a non-zero
+  fixed `scan.source_port`; use `source_port = 0`, change the fixed port, or
+  stop that process.
 - `root or CAP_NET_RAW/CAP_NET_ADMIN is required`: run as root or grant both
   capabilities to the binary.
 - `root qdisc is not tbf`: run `tc-template`, review the output, and apply the

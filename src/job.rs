@@ -685,7 +685,7 @@ fn synthesize_missing_results(
         let ip = Ipv4Addr::from(u32::from_be_bytes(target));
         let port = u16::from_be_bytes(port);
         let protocol = protocol_from_code(protocol[0])?;
-        let id = crate::result::result_id(&job.meta.scan_id, ip, port);
+        let id = crate::result::result_id(&job.meta.scan_id, ip, port, protocol);
         let (state, observed_attempts) = crate::result::decode_state_byte(state[0])?;
         let rtt_ms = decode_rtt_ms(rtt);
         let conflicting_observations = u32::from_le_bytes(conflict_count);
@@ -740,6 +740,9 @@ mod tests {
                 services: vec![],
                 syn_attempts: 3,
                 source_port: 61_000,
+                syn_ttl: crate::config::d_syn_ttl(),
+                syn_window_size: crate::config::d_syn_window_size(),
+                syn_window_scale: crate::config::d_syn_window_scale(),
                 connect_timeout_ms: 3_000,
                 banner_timeout_ms: 5_000,
                 banner_max_bytes: 4_096,
@@ -748,6 +751,7 @@ mod tests {
                 banner_connects_per_second: 10,
                 banner_queue_capacity: 128,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: Default::default(),
             targets: TargetsConfig {
@@ -761,6 +765,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),
@@ -776,7 +781,12 @@ mod tests {
     fn open_result(job: &PreparedJob, cfg: &Config, ip: Ipv4Addr, text: &str) -> ResultV1 {
         ResultV1 {
             schema_version: crate::SCHEMA_VERSION,
-            result_id: crate::result::result_id(&job.meta.scan_id, ip, cfg.scan.port),
+            result_id: crate::result::result_id(
+                &job.meta.scan_id,
+                ip,
+                cfg.scan.port,
+                cfg.scan.protocol,
+            ),
             scan_id: job.meta.scan_id.clone(),
             ip,
             port: cfg.scan.port,
@@ -1145,7 +1155,12 @@ mod tests {
             &job.dir,
             &ResultV1 {
                 schema_version: crate::SCHEMA_VERSION,
-                result_id: crate::result::result_id(&job.meta.scan_id, ip, cfg.scan.port),
+                result_id: crate::result::result_id(
+                    &job.meta.scan_id,
+                    ip,
+                    cfg.scan.port,
+                    cfg.scan.protocol,
+                ),
                 scan_id: job.meta.scan_id.clone(),
                 ip,
                 port: cfg.scan.port,

@@ -635,6 +635,9 @@ mod tests {
                 services: vec![],
                 syn_attempts: 3,
                 source_port: 61_000,
+                syn_ttl: crate::config::d_syn_ttl(),
+                syn_window_size: crate::config::d_syn_window_size(),
+                syn_window_scale: crate::config::d_syn_window_scale(),
                 connect_timeout_ms: 3_000,
                 banner_timeout_ms: 5_000,
                 banner_max_bytes: 4_096,
@@ -643,6 +646,7 @@ mod tests {
                 banner_connects_per_second: 10,
                 banner_queue_capacity: 128,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: Default::default(),
             targets: TargetsConfig {
@@ -656,6 +660,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),
@@ -986,7 +991,12 @@ job_root = "jobs"
             &job.dir,
             &crate::ResultV1 {
                 schema_version: crate::SCHEMA_VERSION,
-                result_id: crate::result::result_id(&job.meta.scan_id, ip, cfg.scan.port),
+                result_id: crate::result::result_id(
+                    &job.meta.scan_id,
+                    ip,
+                    cfg.scan.port,
+                    cfg.scan.protocol,
+                ),
                 scan_id: job.meta.scan_id.clone(),
                 ip,
                 port: cfg.scan.port,
@@ -1004,6 +1014,7 @@ job_root = "jobs"
                     protocol_version: Some("2.0".into()),
                     software_version: Some("OpenSSH_9.6".into()),
                     comments: None,
+                    ..Default::default()
                 }),
                 ftp: None,
                 mysql: None,

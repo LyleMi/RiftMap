@@ -4,7 +4,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 #[cfg(target_os = "linux")]
 use std::{path::Path, process::Command};
@@ -23,7 +23,7 @@ pub fn resolve_source_ip(cfg: &Config) -> anyhow::Result<Ipv4Addr> {
 pub fn estimate(cfg: &Config, count: u64) -> Estimate {
     let packets = count.saturating_mul(cfg.scan.syn_attempts as u64);
     let bytes = packets.saturating_mul(SYN_WIRE_BYTES);
-    let bps = cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio;
+    let bps = application_bytes_per_second(cfg);
     let syn_seconds = bytes as f64 / bps;
     let time_budget_secs = cfg.budget.time_budget_secs;
     let required_syn_application_mbps =
@@ -112,6 +112,209 @@ pub struct Estimate {
     pub budget_warnings: Vec<String>,
 }
 
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+struct ProgressReporter {
+    total: u64,
+    start_done: u64,
+    started: Instant,
+    last_printed: Option<Instant>,
+}
+
+impl ProgressReporter {
+    fn new(job: &PreparedJob, syn_attempts: u8) -> Self {
+        let total = total_progress_units(job.meta.target_count, syn_attempts);
+        Self {
+            total,
+            start_done: progress_units(
+                job.meta.target_count,
+                syn_attempts,
+                job.meta.round,
+                job.meta.next_index,
+            ),
+            started: Instant::now(),
+            last_printed: None,
+        }
+    }
+
+    fn maybe_print(&mut self, job: &PreparedJob, syn_attempts: u8, next_index: u64) {
+        let now = Instant::now();
+        if self
+            .last_printed
+            .is_none_or(|last| now.duration_since(last) >= PROGRESS_INTERVAL)
+        {
+            self.print(job, syn_attempts, next_index, now);
+        }
+    }
+
+    fn print_final(&mut self, job: &PreparedJob, syn_attempts: u8, next_index: u64) {
+        self.print(job, syn_attempts, next_index, Instant::now());
+    }
+
+    fn print(&mut self, job: &PreparedJob, syn_attempts: u8, next_index: u64, now: Instant) {
+        let done = progress_units(
+            job.meta.target_count,
+            syn_attempts,
+            job.meta.round,
+            next_index,
+        );
+        let pct = progress_percent(done, self.total);
+        let elapsed = now.duration_since(self.started);
+        let run_done = done.saturating_sub(self.start_done);
+        let rate = rate_per_second(run_done, elapsed);
+        let eta = eta(run_done, done, self.total, elapsed);
+        let current_round = current_progress_round(job.meta.round, syn_attempts, done, self.total);
+        eprintln!(
+            "progress: {}/{} probes ({pct:.2}%) round {}/{}, sent {}, rate {}, elapsed {}, eta {}",
+            human_count(done),
+            human_count(self.total),
+            current_round,
+            syn_attempts,
+            human_count(job.meta.packets_sent),
+            human_rate(rate),
+            human_duration(elapsed),
+            eta.map(human_duration)
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+        self.last_printed = Some(now);
+    }
+}
+
+fn total_progress_units(target_count: u64, syn_attempts: u8) -> u64 {
+    target_count.saturating_mul(u64::from(syn_attempts))
+}
+
+fn progress_units(target_count: u64, syn_attempts: u8, round: u8, next_index: u64) -> u64 {
+    let total = total_progress_units(target_count, syn_attempts);
+    let rounds_done = u64::from(round).min(u64::from(syn_attempts));
+    rounds_done
+        .saturating_mul(target_count)
+        .saturating_add(next_index.min(target_count))
+        .min(total)
+}
+
+fn progress_percent(done: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        done as f64 * 100.0 / total as f64
+    }
+}
+
+fn rate_per_second(done: u64, elapsed: Duration) -> Option<f64> {
+    let seconds = elapsed.as_secs_f64();
+    (done > 0 && seconds > 0.0).then(|| done as f64 / seconds)
+}
+
+fn eta(run_done: u64, done: u64, total: u64, elapsed: Duration) -> Option<Duration> {
+    if done >= total {
+        return Some(Duration::ZERO);
+    }
+    let rate = rate_per_second(run_done, elapsed)?;
+    (rate > 0.0).then(|| Duration::from_secs_f64((total - done) as f64 / rate))
+}
+
+fn current_progress_round(round: u8, syn_attempts: u8, done: u64, total: u64) -> u8 {
+    if done >= total {
+        syn_attempts
+    } else {
+        round.saturating_add(1).min(syn_attempts)
+    }
+}
+
+pub fn human_progress(
+    target_count: u64,
+    syn_attempts: u8,
+    round: u8,
+    next_index: u64,
+    completed: bool,
+) -> String {
+    let total = total_progress_units(target_count, syn_attempts);
+    let done = if completed {
+        total
+    } else {
+        progress_units(target_count, syn_attempts, round, next_index)
+    };
+    format!(
+        "{}/{} probes ({:.2}%)",
+        human_count(done),
+        human_count(total),
+        progress_percent(done, total)
+    )
+}
+
+pub fn human_count(value: u64) -> String {
+    const UNITS: [&str; 4] = ["", "K", "M", "B"];
+    let mut scaled = value as f64;
+    let mut unit = 0;
+    while scaled >= 1000.0 && unit + 1 < UNITS.len() {
+        scaled /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        value.to_string()
+    } else if scaled >= 100.0 {
+        format!("{scaled:.0}{}", UNITS[unit])
+    } else {
+        format!("{scaled:.1}{}", UNITS[unit])
+    }
+}
+
+fn human_rate(rate: Option<f64>) -> String {
+    rate.map(|rate| format!("{}/s", human_count(rate.round() as u64)))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+pub fn human_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let seconds = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours:02}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn human_count_scales_large_values() {
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1_200), "1.2K");
+        assert_eq!(human_count(125_000), "125K");
+        assert_eq!(human_count(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn human_duration_uses_compact_units() {
+        assert_eq!(human_duration(Duration::from_secs(9)), "9s");
+        assert_eq!(human_duration(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(human_duration(Duration::from_secs(3_900)), "1h 05m");
+        assert_eq!(human_duration(Duration::from_secs(90_000)), "1d 01h");
+    }
+
+    #[test]
+    fn human_progress_reports_probe_attempts() {
+        assert_eq!(
+            human_progress(1_000, 3, 1, 500, false),
+            "1.5K/3.0K probes (50.00%)"
+        );
+        assert_eq!(
+            human_progress(1_000, 3, 3, 0, true),
+            "3.0K/3.0K probes (100.00%)"
+        );
+    }
+}
+
 pub fn dry_run(job: &PreparedJob) -> anyhow::Result<String> {
     use memmap2::Mmap;
     use std::fs::File;
@@ -138,13 +341,17 @@ pub fn doctor(cfg: &Config) -> anyhow::Result<Vec<String>> {
         format!("source IPv4: {}", resolve_source_ip(cfg)?),
         format!("interface: {}", cfg.network.interface),
     ];
-    let listener = std::net::TcpListener::bind(SocketAddrV4::new(
-        Ipv4Addr::UNSPECIFIED,
-        cfg.scan.source_port,
-    ))
-    .map_err(|e| anyhow::anyhow!("source port {} unavailable: {e}", cfg.scan.source_port))?;
-    drop(listener);
-    checks.push(format!("source port {}: available", cfg.scan.source_port));
+    if cfg.scan.source_port == 0 {
+        checks.push("source port: automatic Linux ephemeral range".into());
+    } else {
+        let listener = std::net::TcpListener::bind(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            cfg.scan.source_port,
+        ))
+        .map_err(|e| anyhow::anyhow!("source port {} unavailable: {e}", cfg.scan.source_port))?;
+        drop(listener);
+        checks.push(format!("source port {}: available", cfg.scan.source_port));
+    }
     #[cfg(target_os = "linux")]
     {
         let privileged = unsafe { libc::geteuid() } == 0 || linux_capabilities_ok()?;
@@ -246,6 +453,7 @@ fn effective_runtime_limit_secs(cfg: &Config) -> Option<u64> {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 async fn banner_pipeline(
     job_dir: PathBuf,
     receiver: std::sync::mpsc::Receiver<Option<OpenTarget>>,
@@ -254,18 +462,28 @@ async fn banner_pipeline(
     scan_id: String,
     budget: AsyncTokenBucket,
     banner_state_file: Arc<std::sync::Mutex<std::fs::File>>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     use tokio::{sync::Semaphore, task::JoinSet, time};
     let sem = Arc::new(Semaphore::new(cfg.scan.banner_concurrency));
-    let mut ticker = time::interval(Duration::from_secs_f64(
+    let base_interval = Duration::from_secs_f64(
         1.0 / f64::from(cfg.scan.banner_connects_per_second),
-    ));
+    );
+    let mut ticker = time::interval(base_interval);
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut tasks = JoinSet::new();
     loop {
         drain_completed_banner_tasks(&mut tasks, &job_dir, &banner_state_file).await?;
+        if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(Some(target)) => {
                 ticker.tick().await;
+                let jitter = Duration::from_secs_f64(
+                    base_interval.as_secs_f64() * rand::random::<f64>() * 0.3,
+                );
+                time::sleep(jitter).await;
                 let permit = sem.clone().acquire_owned().await?;
                 let scan = cfg.scan.clone();
                 let scan_id = scan_id.clone();
@@ -289,6 +507,9 @@ async fn banner_pipeline(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+    if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        tasks.abort_all();
+    }
     while !tasks.is_empty() {
         drain_completed_banner_tasks(&mut tasks, &job_dir, &banner_state_file).await?;
         if !tasks.is_empty() {
@@ -305,7 +526,12 @@ async fn drain_completed_banner_tasks(
     banner_state_file: &Arc<std::sync::Mutex<std::fs::File>>,
 ) -> anyhow::Result<()> {
     while let Some(result) = tasks.try_join_next() {
-        let (index, result) = result??;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let (index, result) = result?;
         crate::job::append_event(job_dir, &result)?;
         use std::io::{Seek, SeekFrom, Write};
         let mut file = banner_state_file
@@ -337,17 +563,20 @@ struct SynObservation {
 #[derive(Clone)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct AsyncTokenBucket {
-    inner: Arc<tokio::sync::Mutex<crate::rate::TokenBucket>>,
-    start: std::time::Instant,
+    limiter: SharedBandwidthLimiter,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl AsyncTokenBucket {
+    #[cfg(test)]
     fn new(bucket: crate::rate::TokenBucket, start: std::time::Instant) -> Self {
         Self {
-            inner: Arc::new(tokio::sync::Mutex::new(bucket)),
-            start,
+            limiter: SharedBandwidthLimiter::from_bucket(bucket, start),
         }
+    }
+
+    fn from_shared(limiter: SharedBandwidthLimiter) -> Self {
+        Self { limiter }
     }
 
     async fn consume(&self, bytes: u64) {
@@ -358,10 +587,123 @@ impl AsyncTokenBucket {
     }
 
     async fn reserve(&self, bytes: u64) -> Duration {
-        let mut bucket = self.inner.lock().await;
-        bucket.consume_at(bytes, self.start.elapsed().as_secs_f64())
+        self.limiter.reserve(bytes)
     }
 }
+
+#[derive(Clone)]
+struct SharedBandwidthLimiter {
+    inner: Arc<std::sync::Mutex<BandwidthLimiter>>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl SharedBandwidthLimiter {
+    fn new(cfg: &Config, start: Instant) -> Self {
+        let configured_bps = application_bytes_per_second(cfg);
+        let dynamic_path = cfg.network.dynamic_application_mbps_file.clone();
+        let initial_bps = dynamic_path
+            .as_deref()
+            .and_then(read_dynamic_application_bps)
+            .unwrap_or(configured_bps);
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(BandwidthLimiter {
+                bucket: crate::rate::TokenBucket::new(initial_bps, TOKEN_BUCKET_BURST_SECONDS),
+                start,
+                dynamic_path,
+                current_bps: initial_bps,
+                last_reload: None,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_bucket(bucket: crate::rate::TokenBucket, start: Instant) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(BandwidthLimiter {
+                bucket,
+                start,
+                dynamic_path: None,
+                current_bps: 0.0,
+                last_reload: None,
+            })),
+        }
+    }
+
+    fn reserve(&self, bytes: u64) -> Duration {
+        let mut limiter = self.inner.lock().expect("bandwidth limiter mutex poisoned");
+        limiter.reserve(bytes)
+    }
+
+    fn consume_interruptible(&self, bytes: u64, stopping: &std::sync::atomic::AtomicBool) -> bool {
+        let mut remaining = self.reserve(bytes);
+        while !remaining.is_zero() {
+            if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            let sleep_for = remaining.min(MAX_INTERRUPTIBLE_SLEEP);
+            std::thread::sleep(sleep_for);
+            remaining = remaining.saturating_sub(sleep_for);
+        }
+        !stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct BandwidthLimiter {
+    bucket: crate::rate::TokenBucket,
+    start: Instant,
+    dynamic_path: Option<PathBuf>,
+    current_bps: f64,
+    last_reload: Option<Instant>,
+}
+
+impl BandwidthLimiter {
+    fn reserve(&mut self, bytes: u64) -> Duration {
+        self.reload_if_due();
+        self.bucket
+            .consume_at(bytes, self.start.elapsed().as_secs_f64())
+    }
+
+    fn reload_if_due(&mut self) {
+        let Some(path) = &self.dynamic_path else {
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .last_reload
+            .is_some_and(|last| now.duration_since(last) < DYNAMIC_BANDWIDTH_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.last_reload = Some(now);
+        let Some(next_bps) = read_dynamic_application_bps(path) else {
+            return;
+        };
+        if (next_bps - self.current_bps).abs() < f64::EPSILON {
+            return;
+        }
+        self.bucket.set_rate_at(
+            next_bps,
+            TOKEN_BUCKET_BURST_SECONDS,
+            self.start.elapsed().as_secs_f64(),
+        );
+        self.current_bps = next_bps;
+    }
+}
+
+fn application_bytes_per_second(cfg: &Config) -> f64 {
+    cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio
+}
+
+fn read_dynamic_application_bps(path: &std::path::Path) -> Option<f64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mbps = raw.trim().parse::<f64>().ok()?;
+    (mbps.is_finite() && mbps > 0.0).then_some(mbps * 1_000_000.0 / 8.0)
+}
+
+const TOKEN_BUCKET_BURST_SECONDS: f64 = 0.1;
+const DYNAMIC_BANDWIDTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const MAX_INTERRUPTIBLE_SLEEP: Duration = Duration::from_millis(100);
 
 struct BannerObservation {
     raw: Vec<u8>,
@@ -395,19 +737,249 @@ async fn inspect_banner(
             }
         };
         observation.raw.clear();
-        observation.status = read_banner(&mut stream, scan, service, &mut observation.raw).await;
+        if service.protocol == crate::Protocol::Ssh {
+            observation.status = inspect_ssh_stream(&mut stream, scan, &mut observation).await;
+        } else {
+            observation.status =
+                read_banner(&mut stream, scan, service, &mut observation.raw).await;
+        }
         if observation.status == crate::BannerStatus::Ok {
-            match crate::protocol::parse(service.protocol, &observation.raw) {
-                Ok(parsed) => observation.parsed = Some(parsed),
-                Err(status) => observation.status = status,
+            if observation.parsed.is_none() {
+                match crate::protocol::parse(service.protocol, &observation.raw) {
+                    Ok(mut parsed) => {
+                        if let Some(ssh) = parsed.ssh.as_mut() {
+                            ssh.probe_mode = Some(ssh_probe_mode_name(scan.ssh.probe_mode).into());
+                        }
+                        observation.parsed = Some(parsed);
+                    }
+                    Err(status) => observation.status = status,
+                }
+            } else if let Some(ssh) = observation
+                .parsed
+                .as_mut()
+                .and_then(|parsed| parsed.ssh.as_mut())
+            {
+                ssh.probe_mode = Some(ssh_probe_mode_name(scan.ssh.probe_mode).into());
             }
-            break;
+            if observation.status == crate::BannerStatus::Ok {
+                break;
+            } else {
+                if terminal_banner_status(observation.status) {
+                    break;
+                }
+            }
         }
         if terminal_banner_status(observation.status) {
             break;
         }
     }
     Ok(make_result(scan_id, ip, service, syn, observation))
+}
+
+async fn inspect_ssh_stream(
+    stream: &mut tokio::net::TcpStream,
+    scan: &crate::config::ScanConfig,
+    observation: &mut BannerObservation,
+) -> crate::BannerStatus {
+    use tokio::io::AsyncWriteExt;
+
+    let service = crate::config::ServiceConfig {
+        port: 22,
+        protocol: crate::Protocol::Ssh,
+    };
+    let status = read_banner(stream, scan, service, &mut observation.raw).await;
+    if status != crate::BannerStatus::Ok {
+        return status;
+    }
+    if scan.ssh.probe_mode == crate::config::SshProbeMode::PassiveBanner {
+        return status;
+    }
+    let client_id = format!("{}\r\n", scan.ssh.client_id);
+    match tokio::time::timeout(
+        Duration::from_millis(scan.banner_timeout_ms),
+        stream.write_all(client_id.as_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return status,
+    }
+    if scan.ssh.probe_mode != crate::config::SshProbeMode::KexinitProbe {
+        return status;
+    }
+    let packet = build_ssh_kexinit_probe();
+    match tokio::time::timeout(
+        Duration::from_millis(scan.banner_timeout_ms),
+        stream.write_all(&packet),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return status,
+    }
+    let Ok(Some(server_kexinit)) = read_ssh_packet(stream, scan).await else {
+        return status;
+    };
+    let Ok(kex) = crate::protocol::parse_ssh_kexinit_packet(&server_kexinit) else {
+        return status;
+    };
+    let mut parsed = crate::protocol::parse(crate::Protocol::Ssh, &observation.raw).ok();
+    if let Some(ssh) = parsed.as_mut().and_then(|parsed| parsed.ssh.as_mut()) {
+        ssh.kex_algorithms = Some(kex.kex_algorithms);
+        ssh.server_host_key_algorithms = Some(kex.server_host_key_algorithms);
+        ssh.encryption_algorithms_client_to_server =
+            Some(kex.encryption_algorithms_client_to_server);
+        ssh.encryption_algorithms_server_to_client =
+            Some(kex.encryption_algorithms_server_to_client);
+        ssh.mac_algorithms_client_to_server = Some(kex.mac_algorithms_client_to_server);
+        ssh.mac_algorithms_server_to_client = Some(kex.mac_algorithms_server_to_client);
+        ssh.compression_algorithms_client_to_server =
+            Some(kex.compression_algorithms_client_to_server);
+        ssh.compression_algorithms_server_to_client =
+            Some(kex.compression_algorithms_server_to_client);
+    }
+    observation.parsed = parsed;
+    status
+}
+
+async fn read_ssh_packet(
+    stream: &mut tokio::net::TcpStream,
+    scan: &crate::config::ScanConfig,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = [0u8; 5];
+    match tokio::time::timeout(
+        Duration::from_millis(scan.banner_timeout_ms),
+        stream.read_exact(&mut header),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => return Ok(None),
+    }
+    let packet_len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+    let total = packet_len
+        .checked_add(4)
+        .filter(|total| *total <= scan.banner_max_bytes)
+        .ok_or_else(|| anyhow::anyhow!("SSH KEXINIT packet exceeds banner_max_bytes"))?;
+    let mut packet = Vec::with_capacity(total);
+    packet.extend_from_slice(&header);
+    packet.resize(total, 0);
+    tokio::time::timeout(
+        Duration::from_millis(scan.banner_timeout_ms),
+        stream.read_exact(&mut packet[5..]),
+    )
+    .await??;
+    Ok(Some(packet))
+}
+
+fn build_ssh_kexinit_probe() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(20);
+    payload.extend_from_slice(&rand::random::<[u8; 16]>());
+    write_ssh_namelist(
+        &mut payload,
+        &[
+            "sntrup761x25519-sha512@openssh.com",
+            "curve25519-sha256",
+            "curve25519-sha256@libssh.org",
+            "ecdh-sha2-nistp256",
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
+            "diffie-hellman-group16-sha512",
+            "diffie-hellman-group18-sha512",
+            "diffie-hellman-group14-sha256",
+        ],
+    );
+    write_ssh_namelist(
+        &mut payload,
+        &[
+            "ssh-ed25519-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+            "sk-ssh-ed25519-cert-v01@openssh.com",
+            "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            "rsa-sha2-512-cert-v01@openssh.com",
+            "rsa-sha2-256-cert-v01@openssh.com",
+            "ssh-ed25519",
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
+            "sk-ssh-ed25519@openssh.com",
+            "sk-ecdsa-sha2-nistp256@openssh.com",
+            "rsa-sha2-512",
+            "rsa-sha2-256",
+        ],
+    );
+    for _ in 0..2 {
+        write_ssh_namelist(
+            &mut payload,
+            &[
+                "chacha20-poly1305@openssh.com",
+                "aes128-ctr",
+                "aes192-ctr",
+                "aes256-ctr",
+                "aes128-gcm@openssh.com",
+                "aes256-gcm@openssh.com",
+            ],
+        );
+    }
+    for _ in 0..2 {
+        write_ssh_namelist(
+            &mut payload,
+            &[
+                "umac-64-etm@openssh.com",
+                "umac-128-etm@openssh.com",
+                "hmac-sha2-256-etm@openssh.com",
+                "hmac-sha2-512-etm@openssh.com",
+                "hmac-sha1-etm@openssh.com",
+                "umac-64@openssh.com",
+                "umac-128@openssh.com",
+                "hmac-sha2-256",
+                "hmac-sha2-512",
+                "hmac-sha1",
+            ],
+        );
+    }
+    for _ in 0..2 {
+        write_ssh_namelist(&mut payload, &["none", "zlib@openssh.com"]);
+    }
+    write_ssh_namelist(&mut payload, &[]);
+    write_ssh_namelist(&mut payload, &[]);
+    payload.push(0);
+    payload.extend_from_slice(&0u32.to_be_bytes());
+
+    let block_size = 8;
+    let mut padding_len = block_size - ((payload.len() + 5) % block_size);
+    if padding_len < 4 {
+        padding_len += block_size;
+    }
+    let packet_len = payload.len() + padding_len + 1;
+    let mut packet = Vec::with_capacity(packet_len + 4);
+    packet.extend_from_slice(&(packet_len as u32).to_be_bytes());
+    packet.push(padding_len as u8);
+    packet.extend_from_slice(&payload);
+    let mut padding = vec![0u8; padding_len];
+    rand::fill(&mut padding[..]);
+    packet.extend_from_slice(&padding);
+    packet
+}
+
+fn write_ssh_namelist(out: &mut Vec<u8>, names: &[&str]) {
+    let value = names.join(",");
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn ssh_probe_mode_name(mode: crate::config::SshProbeMode) -> &'static str {
+    match mode {
+        crate::config::SshProbeMode::PassiveBanner => "passive_banner",
+        crate::config::SshProbeMode::VersionExchange => "version_exchange",
+        crate::config::SshProbeMode::KexinitProbe => "kexinit_probe",
+    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -497,7 +1069,7 @@ fn make_result(
     let parsed = observation.parsed.unwrap_or_default();
     crate::ResultV1 {
         schema_version: crate::SCHEMA_VERSION,
-        result_id: crate::result::result_id(scan_id, ip, service.port),
+        result_id: crate::result::result_id(scan_id, ip, service.port, service.protocol),
         scan_id: scan_id.into(),
         ip,
         port: service.port,
@@ -696,6 +1268,8 @@ mod simulation {
         sent_times: &mut [u8],
         banner_states: &mut [u8],
     ) -> anyhow::Result<()> {
+        let mut progress = ProgressReporter::new(job, cfg.scan.syn_attempts);
+        progress.maybe_print(job, cfg.scan.syn_attempts, job.meta.next_index);
         for round in job.meta.round..cfg.scan.syn_attempts {
             let start_order = if round == job.meta.round {
                 job.meta.next_index
@@ -707,6 +1281,7 @@ mod simulation {
             for order in start_order..job.meta.target_count {
                 let index = perm.get(order) as usize;
                 if state_rank(states[index]) != crate::TargetState::NoResponse.rank() {
+                    progress.maybe_print(job, cfg.scan.syn_attempts, order + 1);
                     continue;
                 }
                 job.meta.packets_sent = job.meta.packets_sent.saturating_add(1);
@@ -717,6 +1292,7 @@ mod simulation {
                 };
                 let state = simulated_state(cfg, &job.meta.scan_id, endpoint);
                 if state == crate::TargetState::NoResponse {
+                    progress.maybe_print(job, cfg.scan.syn_attempts, order + 1);
                     continue;
                 }
                 states[index] = crate::result::encode_state_byte(state, attempts);
@@ -731,10 +1307,13 @@ mod simulation {
                 if order % 10_000 == 0 {
                     job.checkpoint(order + 1)?;
                 }
+                progress.maybe_print(job, cfg.scan.syn_attempts, order + 1);
             }
             job.meta.round = round + 1;
             job.checkpoint(0)?;
+            progress.maybe_print(job, cfg.scan.syn_attempts, 0);
         }
+        progress.print_final(job, cfg.scan.syn_attempts, job.meta.next_index);
         Ok(())
     }
 
@@ -836,10 +1415,10 @@ mod simulation {
 
     fn simulated_banner(protocol: crate::Protocol) -> Vec<u8> {
         match protocol {
-            crate::Protocol::Ssh => b"SSH-2.0-RiftMapSim_1.0\r\n".to_vec(),
-            crate::Protocol::Ftp => b"220 riftmap-sim FTP ready\r\n".to_vec(),
+            crate::Protocol::Ssh => b"SSH-2.0-OpenSSH_9.7p1\r\n".to_vec(),
+            crate::Protocol::Ftp => b"220 ftp.example.com FTP ready\r\n".to_vec(),
             crate::Protocol::Mysql => mysql_banner(),
-            crate::Protocol::Smtp => b"220 riftmap-sim ESMTP ready\r\n".to_vec(),
+            crate::Protocol::Smtp => b"220 mail.example.com ESMTP ready\r\n".to_vec(),
             crate::Protocol::Redis => b"+PONG\r\n".to_vec(),
             crate::Protocol::Postgres => postgres_banner(),
         }
@@ -847,7 +1426,7 @@ mod simulation {
 
     fn mysql_banner() -> Vec<u8> {
         let mut payload = vec![10];
-        payload.extend_from_slice(b"8.0.36-riftmap-sim\0");
+        payload.extend_from_slice(b"8.0.36\0");
         payload.extend_from_slice(&1u32.to_le_bytes());
         payload.extend_from_slice(b"12345678");
         payload.push(0);
@@ -874,7 +1453,7 @@ mod simulation {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use crate::{packet, rate::TokenBucket};
+    use crate::packet;
     use anyhow::Context;
     use memmap2::Mmap;
     use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
@@ -924,6 +1503,22 @@ mod linux {
         source_port: u16,
         syn_attempts: u8,
         now_ms: u32,
+        nonce: u32,
+    }
+
+    fn local_source_port(
+        configured: u16,
+        secret: &[u8; 32],
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        dest_port: u16,
+        nonce: u32,
+    ) -> u16 {
+        if configured == 0 {
+            packet::ephemeral_source_port(secret, src, dst, dest_port, nonce)
+        } else {
+            configured
+        }
     }
 
     fn receive(cap: &mut pcap::Capture<pcap::Active>, context: &mut ReplyContext<'_>) {
@@ -977,19 +1572,27 @@ mod linux {
         let source_port = u16::from_be_bytes([data[tcp], data[tcp + 1]]);
         let dest_port = u16::from_be_bytes([data[tcp + 2], data[tcp + 3]]);
         let ack = u32::from_be_bytes(data[tcp + 8..tcp + 12].try_into().unwrap());
+        let Some(index) = find_index(context.targets, context.ports, remote, source_port) else {
+            return;
+        };
+        let expected_source_port = local_source_port(
+            context.source_port,
+            context.secret,
+            context.src,
+            remote,
+            source_port,
+            context.nonce,
+        );
         let cookie = packet::syn_cookie(
             context.secret,
             context.src,
             remote,
-            context.source_port,
+            expected_source_port,
             source_port,
         );
-        if dest_port != context.source_port || !packet::valid_ack(cookie, ack) {
+        if dest_port != expected_source_port || !packet::valid_ack(cookie, ack) {
             return;
         }
-        let Some(index) = find_index(context.targets, context.ports, remote, source_port) else {
-            return;
-        };
         let flags = data[tcp + 13];
         if flags & 0x12 == 0x12 {
             if observe_response(context, index, crate::TargetState::Open) {
@@ -1128,15 +1731,23 @@ mod linux {
     }
 
     fn valid_inner_reply(reply: &InnerTcpReply, context: &ReplyContext<'_>) -> bool {
+        let expected_source_port = local_source_port(
+            context.source_port,
+            context.secret,
+            context.src,
+            reply.remote,
+            reply.dest_port,
+            context.nonce,
+        );
         let cookie = packet::syn_cookie(
             context.secret,
             context.src,
             reply.remote,
-            reply.source_port,
+            expected_source_port,
             reply.dest_port,
         );
         reply.source_ip == context.src
-            && reply.source_port == context.source_port
+            && reply.source_port == expected_source_port
             && reply.sequence == cookie
     }
 
@@ -1156,10 +1767,12 @@ mod linux {
         raw: Socket,
         stopping: Arc<AtomicBool>,
         start: Instant,
-        bucket: TokenBucket,
+        limiter: SharedBandwidthLimiter,
         tx_start: TxStats,
         mss: u16,
+        timestamp_base: u32,
         timed_out: Arc<AtomicBool>,
+        ip_id_counter: u32,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1211,23 +1824,33 @@ mod linux {
         handle: thread::JoinHandle<anyhow::Result<()>>,
     }
 
-    const SENDMMSG_BATCH: usize = 64;
+    const SENDMMSG_BATCH_MIN: usize = 32;
+    const SENDMMSG_BATCH_RANGE: usize = 65;
+
+    fn batch_size(secret: &[u8; 32], order: u64) -> usize {
+        let mut h = blake3::Hasher::new_keyed(secret);
+        h.update(b"batch-size");
+        h.update(&order.to_le_bytes());
+        let sample = h.finalize().as_bytes()[0] as usize;
+        SENDMMSG_BATCH_MIN + (sample % SENDMMSG_BATCH_RANGE)
+    }
 
     fn scan_runtime(job: &PreparedJob, cfg: &Config) -> anyhow::Result<ScanRuntime> {
         let source_ip = resolve_source_ip(cfg)?;
         verify_rate_limit(cfg)?;
         let seed = crate::job::decode_seed(&job.meta.seed_hex)?;
         let perm = Permutation::new(job.meta.target_count, seed)?;
-        let cap = capture_socket(cfg)?;
+        let cap = capture_socket(cfg, source_ip)?;
         let raw = raw_socket(cfg)?;
         let tx_start = interface_tx_stats(Path::new("/sys/class/net"), &cfg.network.interface)
             .context("read starting interface TX counters")?;
         let mss = interface_mss(Path::new("/sys/class/net"), &cfg.network.interface)
             .context("derive SYN MSS from interface MTU")?;
-        let rate =
-            cfg.network.provider_egress_mbps * 1_000_000.0 / 8.0 * cfg.network.application_ratio;
         let stopping = Arc::new(AtomicBool::new(false));
         install_stop_handler(&stopping)?;
+        let start = Instant::now();
+        let limiter = SharedBandwidthLimiter::new(cfg, start);
+        let timestamp_base = rand::random();
         let timed_out = Arc::new(AtomicBool::new(false));
         if let Some(max_runtime_secs) = effective_runtime_limit_secs(cfg) {
             let stopping = stopping.clone();
@@ -1245,11 +1868,13 @@ mod linux {
             cap,
             raw,
             stopping,
-            start: Instant::now(),
-            bucket: TokenBucket::new(rate, 0.1),
+            start,
+            limiter,
             tx_start,
             mss,
+            timestamp_base,
             timed_out,
+            ip_id_counter: 0,
         })
     }
 
@@ -1260,20 +1885,37 @@ mod linux {
         Ok(())
     }
 
-    fn capture_socket(cfg: &Config) -> anyhow::Result<pcap::Capture<pcap::Active>> {
+    fn capture_socket(cfg: &Config, source_ip: Ipv4Addr) -> anyhow::Result<pcap::Capture<pcap::Active>> {
         let mut cap = pcap::Capture::from_device(cfg.network.interface.as_str())?
             .promisc(false)
             .immediate_mode(true)
             .timeout(1)
             .open()?;
-        cap.filter(
-            &format!(
-                "(tcp src port {} and dst port {}) or icmp",
-                cfg.scan.port, cfg.scan.source_port
-            ),
-            true,
-        )?;
+        cap.filter(&capture_filter(cfg, source_ip), true)?;
         Ok(cap.setnonblock()?)
+    }
+
+    fn capture_filter(cfg: &Config, source_ip: Ipv4Addr) -> String {
+        let services = cfg.scan.services();
+        let tcp_ports = services
+            .iter()
+            .map(|service| format!("src port {}", service.port))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        let tcp = if cfg.scan.source_port == 0 {
+            format!(
+                "tcp and dst host {} and ({tcp_ports}) and dst portrange {}-{}",
+                source_ip,
+                packet::LINUX_EPHEMERAL_FIRST,
+                packet::LINUX_EPHEMERAL_LAST
+            )
+        } else {
+            format!(
+                "tcp and ({tcp_ports}) and dst port {}",
+                cfg.scan.source_port
+            )
+        };
+        format!("({tcp}) or icmp")
     }
 
     fn interface_tx_stats(root: &Path, interface: &str) -> anyhow::Result<TxStats> {
@@ -1332,8 +1974,9 @@ mod linux {
         let source_ip = runtime.source_ip;
         let cfg = cfg.clone();
         let scan_id = job.meta.scan_id.clone();
-        let budget = AsyncTokenBucket::new(runtime.bucket.clone(), runtime.start);
+        let budget = AsyncTokenBucket::from_shared(runtime.limiter.clone());
         let worker_state_file = banner_state_file.clone();
+        let stopping = runtime.stopping.clone();
         let handle = thread::spawn(move || {
             tokio::runtime::Runtime::new()?.block_on(banner_pipeline(
                 job_dir,
@@ -1343,6 +1986,7 @@ mod linux {
                 scan_id,
                 budget,
                 worker_state_file,
+                stopping,
             ))
         });
         Ok(BannerRunner { sender, handle })
@@ -1429,6 +2073,8 @@ mod linux {
         runtime: &mut ScanRuntime,
         buffers: &mut ScanBuffers<'_>,
     ) -> anyhow::Result<()> {
+        let mut progress = ProgressReporter::new(job, cfg.scan.syn_attempts);
+        progress.maybe_print(job, cfg.scan.syn_attempts, job.meta.next_index);
         'rounds: for round in job.meta.round..cfg.scan.syn_attempts {
             let start_order = if round == job.meta.round {
                 job.meta.next_index
@@ -1453,13 +2099,16 @@ mod linux {
                 if order % 10_000 == 0 {
                     job.checkpoint(order)?;
                 }
+                progress.maybe_print(job, cfg.scan.syn_attempts, order);
             }
             job.meta.round = round + 1;
             job.checkpoint(0)?;
+            progress.maybe_print(job, cfg.scan.syn_attempts, 0);
             if round + 1 < cfg.scan.syn_attempts {
                 pause_between_rounds(cfg, runtime, buffers, round + 1);
             }
         }
+        progress.print_final(job, cfg.scan.syn_attempts, job.meta.next_index);
         Ok(())
     }
 
@@ -1469,29 +2118,46 @@ mod linux {
         runtime: &mut ScanRuntime,
         buffers: &mut ScanBuffers<'_>,
     ) -> Vec<PreparedSyn> {
-        let mut batch = Vec::with_capacity(SENDMMSG_BATCH);
-        while *order < buffers.states.len() as u64 && batch.len() < SENDMMSG_BATCH {
-            let idx = runtime.perm.get(*order) as usize;
-            *order += 1;
+        let current_batch_size = batch_size(&runtime.seed, *order);
+        let mut batch = Vec::with_capacity(current_batch_size);
+        while *order < buffers.states.len() as u64 && batch.len() < current_batch_size {
+            let current_order = *order;
+            let idx = runtime.perm.get(current_order) as usize;
             if state_rank(buffers.states[idx]) != crate::TargetState::NoResponse.rank() {
+                *order += 1;
                 continue;
             }
             let ip = target_ip(buffers.targets, idx);
             let service = target_service(buffers.ports, buffers.protocols, idx);
-            let wait = runtime.bucket.consume_at(
-                packet::SYN_WIRE_BYTES,
-                runtime.start.elapsed().as_secs_f64(),
+            let source_port = local_source_port(
+                cfg.scan.source_port,
+                &runtime.seed,
+                runtime.source_ip,
+                ip,
+                service.port,
+                runtime.timestamp_base,
             );
-            if !wait.is_zero() {
-                thread::sleep(wait);
+            if !runtime
+                .limiter
+                .consume_interruptible(packet::SYN_WIRE_BYTES, &runtime.stopping)
+            {
+                return batch;
             }
+            *order += 1;
             write_u32(buffers.sent_times, idx, elapsed_ms(runtime.start));
             let seq = packet::syn_cookie(
                 &runtime.seed,
                 runtime.source_ip,
                 ip,
-                cfg.scan.source_port,
+                source_port,
                 service.port,
+            );
+            runtime.ip_id_counter = runtime.ip_id_counter.wrapping_add(1);
+            let ip_id = packet::ip_identification(
+                &runtime.seed,
+                runtime.source_ip,
+                ip,
+                runtime.ip_id_counter,
             );
             batch.push(PreparedSyn {
                 ip,
@@ -1499,10 +2165,18 @@ mod linux {
                 packet: packet::SynPacket {
                     src: runtime.source_ip,
                     dst: ip,
-                    source_port: cfg.scan.source_port,
+                    source_port,
                     dest_port: service.port,
                     seq,
                     mss: runtime.mss,
+                    ttl: cfg.scan.syn_ttl,
+                    window_size: cfg.scan.syn_window_size,
+                    window_scale: cfg.scan.syn_window_scale,
+                    timestamp_value: runtime
+                        .timestamp_base
+                        .wrapping_add(elapsed_ms(runtime.start))
+                        .wrapping_add(packet::timestamp_jitter(&runtime.seed, ip)),
+                    ip_id,
                 }
                 .encode(),
             });
@@ -1575,13 +2249,22 @@ mod linux {
         }
     }
 
+    fn round_pause_ms(secret: &[u8; 32], round: u8) -> u64 {
+        let mut h = blake3::Hasher::new_keyed(secret);
+        h.update(b"round-pause");
+        h.update(&[round]);
+        let sample = u16::from_be_bytes(h.finalize().as_bytes()[..2].try_into().unwrap());
+        1000 + (sample as u64 % 501)
+    }
+
     fn pause_between_rounds(
         cfg: &Config,
         runtime: &mut ScanRuntime,
         buffers: &mut ScanBuffers<'_>,
         syn_attempts: u8,
     ) {
-        thread::sleep(Duration::from_secs(1));
+        let pause = Duration::from_millis(round_pause_ms(&runtime.seed, syn_attempts));
+        thread::sleep(pause);
         receive_replies(cfg, runtime, buffers, syn_attempts);
     }
 
@@ -1606,6 +2289,7 @@ mod linux {
             source_port: cfg.scan.source_port,
             syn_attempts,
             now_ms: elapsed_ms(runtime.start),
+            nonce: runtime.timestamp_base,
         };
         receive(&mut runtime.cap, &mut context);
     }
@@ -1635,6 +2319,7 @@ mod linux {
         maps.states.flush()?;
         maps.rtts.flush()?;
         maps.conflicts.flush()?;
+        maps.banner_states.flush()?;
         record_capture_stats(job, &mut runtime.cap)?;
         let completed = job.meta.round >= cfg.scan.syn_attempts;
         let next_index =
@@ -1760,7 +2445,10 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::config::{Protocol, ScanConfig};
+        use crate::config::{
+            BudgetConfig, NetworkConfig, OutputConfig, Protocol, ScanConfig, SimulationConfig,
+            SourceIp, TargetsConfig,
+        };
 
         fn scan_config() -> ScanConfig {
             ScanConfig {
@@ -1769,6 +2457,9 @@ mod linux {
                 services: vec![],
                 syn_attempts: 1,
                 source_port: 61_000,
+                syn_ttl: crate::config::d_syn_ttl(),
+                syn_window_size: crate::config::d_syn_window_size(),
+                syn_window_scale: crate::config::d_syn_window_scale(),
                 connect_timeout_ms: 3_000,
                 banner_timeout_ms: 5_000,
                 banner_max_bytes: 4_096,
@@ -1777,6 +2468,7 @@ mod linux {
                 banner_connects_per_second: 1,
                 banner_queue_capacity: 8,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             }
         }
 
@@ -1902,6 +2594,51 @@ mod linux {
         }
 
         #[test]
+        fn capture_filter_includes_all_service_ports_for_auto_source_port() {
+            let mut cfg = Config {
+                scan: scan_config(),
+                budget: BudgetConfig::default(),
+                targets: TargetsConfig {
+                    include: vec!["fixtures/targets.example.txt".into()],
+                    exclude: vec![],
+                    allow_private: false,
+                    max_targets: 10,
+                },
+                network: NetworkConfig {
+                    interface: "eth0".into(),
+                    source_ip: SourceIp("192.0.2.10".into()),
+                    provider_egress_mbps: 100.0,
+                    application_ratio: 0.8,
+                    dynamic_application_mbps_file: None,
+                    tc_ratio: 0.85,
+                    require_tc: false,
+                    accounting: "estimated-wire".into(),
+                },
+                output: OutputConfig {
+                    job_root: ".riftmap/jobs".into(),
+                    output_all: false,
+                },
+                simulation: SimulationConfig::default(),
+            };
+            cfg.scan.source_port = 0;
+            cfg.scan.services = vec![
+                crate::config::ServiceConfig {
+                    port: 22,
+                    protocol: crate::Protocol::Ssh,
+                },
+                crate::config::ServiceConfig {
+                    port: 25,
+                    protocol: crate::Protocol::Smtp,
+                },
+            ];
+
+            assert_eq!(
+                capture_filter(&cfg, "192.0.2.10".parse().unwrap()),
+                "(tcp and dst host 192.0.2.10 and (src port 22 or src port 25) and dst portrange 32768-60999) or icmp"
+            );
+        }
+
+        #[test]
         fn ipv4_header_accepts_raw_ipv4() {
             let packet = ipv4_packet(6, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, &[0; 20]);
 
@@ -1989,6 +2726,51 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
+            };
+
+            handle_tcp_reply(&packet, offset, ihl, &mut context);
+
+            assert_state(states[0], crate::TargetState::Open, 1);
+            assert_eq!(decode_rtt_ms(&rtts, 0), Some(10.0));
+        }
+
+        #[test]
+        fn auto_source_port_syn_ack_marks_target_open() {
+            let src = Ipv4Addr::new(192, 0, 2, 10);
+            let remote = Ipv4Addr::new(198, 51, 100, 20);
+            let secret = [7; 32];
+            let mut scan = scan_config();
+            scan.source_port = 0;
+            let source_port = local_source_port(scan.source_port, &secret, src, remote, scan.port, 0);
+            let cookie = packet::syn_cookie(&secret, src, remote, source_port, scan.port);
+            let tcp = tcp_segment(scan.port, source_port, 0, cookie.wrapping_add(1), 0x12);
+            let packet = ethernet_ipv4(ipv4_packet(6, remote, src, &tcp));
+            let (offset, ihl, _) = ipv4_header(&packet).unwrap();
+            let mut states = [0];
+            let mut rtts = [0; 4];
+            let mut conflicts = [0; 4];
+            let mut sent_times = [0; 4];
+            write_u32(&mut sent_times, 0, 90);
+            let targets = remote.octets();
+            let ports = scan.port.to_be_bytes();
+            let protocols = [crate::job::protocol_code(scan.protocol)];
+            let mut context = ReplyContext {
+                states: &mut states,
+                rtts: &mut rtts,
+                conflicts: &mut conflicts,
+                sent_times: &sent_times,
+                targets: &targets,
+                ports: &ports,
+                protocols: &protocols,
+                banner_states: None,
+                banner_sender: None,
+                secret: &secret,
+                src,
+                source_port: scan.source_port,
+                syn_attempts: 1,
+                now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
@@ -2030,6 +2812,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
@@ -2071,6 +2854,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&packet, offset, ihl, &mut context);
@@ -2123,6 +2907,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_tcp_reply(&syn_ack, syn_offset, syn_ihl, &mut context);
@@ -2171,6 +2956,7 @@ mod linux {
                 source_port: scan.source_port,
                 syn_attempts: 1,
                 now_ms: 100,
+                nonce: 0,
             };
 
             handle_icmp_reply(&packet, offset, ihl, &mut context);
@@ -2260,6 +3046,27 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_bandwidth_file_updates_limiter() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let control = temp.path().join("application-mbps");
+        std::fs::write(&control, "16\n")?;
+        let mut limiter = super::BandwidthLimiter {
+            bucket: crate::rate::TokenBucket::new(1_000_000.0, super::TOKEN_BUCKET_BURST_SECONDS),
+            start: Instant::now(),
+            dynamic_path: Some(control.clone()),
+            current_bps: 1_000_000.0,
+            last_reload: Some(Instant::now() - Duration::from_secs(2)),
+        };
+
+        assert_eq!(limiter.reserve(200_000), Duration::ZERO);
+        std::fs::write(&control, "not-yet-valid")?;
+        limiter.last_reload = Some(Instant::now() - Duration::from_secs(2));
+
+        assert!(limiter.reserve(200_000) <= Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
     fn estimate_reports_time_budget_bottlenecks() {
         let cfg = crate::Config {
             scan: ScanConfig {
@@ -2268,6 +3075,9 @@ mod tests {
                 services: vec![],
                 syn_attempts: 3,
                 source_port: 61_000,
+                syn_ttl: crate::config::d_syn_ttl(),
+                syn_window_size: crate::config::d_syn_window_size(),
+                syn_window_scale: crate::config::d_syn_window_scale(),
                 connect_timeout_ms: 3_000,
                 banner_timeout_ms: 5_000,
                 banner_max_bytes: 4_096,
@@ -2276,6 +3086,7 @@ mod tests {
                 banner_connects_per_second: 200,
                 banner_queue_capacity: 1024,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: BudgetConfig {
                 time_budget_secs: Some(7_200),
@@ -2293,6 +3104,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 1.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),
@@ -2332,6 +3144,9 @@ mod tests {
                 services: vec![],
                 syn_attempts: 3,
                 source_port: 61_000,
+                syn_ttl: crate::config::d_syn_ttl(),
+                syn_window_size: crate::config::d_syn_window_size(),
+                syn_window_scale: crate::config::d_syn_window_scale(),
                 connect_timeout_ms: 3_000,
                 banner_timeout_ms: 5_000,
                 banner_max_bytes: 4_096,
@@ -2340,6 +3155,7 @@ mod tests {
                 banner_connects_per_second: 200,
                 banner_queue_capacity: 1024,
                 max_runtime_secs: Some(100),
+                ssh: Default::default(),
             },
             budget: BudgetConfig {
                 time_budget_secs: Some(30),
@@ -2357,6 +3173,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: false,
                 accounting: "estimated-wire".into(),
@@ -2396,6 +3213,9 @@ mod tests {
                 ],
                 syn_attempts: 3,
                 source_port: 61_000,
+                syn_ttl: crate::config::d_syn_ttl(),
+                syn_window_size: crate::config::d_syn_window_size(),
+                syn_window_scale: crate::config::d_syn_window_scale(),
                 connect_timeout_ms: 3_000,
                 banner_timeout_ms: 5_000,
                 banner_max_bytes: 4_096,
@@ -2404,6 +3224,7 @@ mod tests {
                 banner_connects_per_second: 200,
                 banner_queue_capacity: 1024,
                 max_runtime_secs: None,
+                ssh: Default::default(),
             },
             budget: BudgetConfig::default(),
             targets: TargetsConfig {
@@ -2417,6 +3238,7 @@ mod tests {
                 source_ip: SourceIp("127.0.0.1".into()),
                 provider_egress_mbps: 100.0,
                 application_ratio: 0.8,
+                dynamic_application_mbps_file: None,
                 tc_ratio: 0.85,
                 require_tc: true,
                 accounting: "estimated-wire".into(),

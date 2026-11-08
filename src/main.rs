@@ -74,6 +74,28 @@ enum Command {
         #[arg(long)]
         job: PathBuf,
     },
+    Coordinator {
+        #[arg(short = 'c', long)]
+        config: PathBuf,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long, default_value = ".riftmap/distributed.sqlite")]
+        state: PathBuf,
+    },
+    Worker {
+        #[arg(long)]
+        coordinator: std::net::SocketAddr,
+        #[arg(long)]
+        work_dir: PathBuf,
+        #[arg(long)]
+        worker_id: Option<String>,
+        #[arg(long)]
+        exit_when_idle: bool,
+    },
+    Distributed {
+        #[command(subcommand)]
+        command: DistributedCommand,
+    },
     Job {
         #[command(subcommand)]
         command: JobCommand,
@@ -184,6 +206,40 @@ enum JobCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum DistributedCommand {
+    CreateScan {
+        #[arg(short = 'c', long)]
+        config: PathBuf,
+        #[arg(long)]
+        task_size: u64,
+        #[arg(long, default_value = ".riftmap/distributed.sqlite")]
+        state: PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        scan_id: String,
+        #[arg(long, default_value = ".riftmap/distributed.sqlite")]
+        state: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Export {
+        #[arg(long)]
+        scan_id: String,
+        #[arg(long, default_value = ".riftmap/distributed.sqlite")]
+        state: PathBuf,
+        #[arg(long, default_value = "results.ndjson")]
+        output: PathBuf,
+    },
+    Report {
+        #[arg(long)]
+        scan_id: String,
+        #[arg(long, default_value = ".riftmap/distributed.sqlite")]
+        state: PathBuf,
+    },
+}
+
 fn load_job_cfg(dir: &Path) -> anyhow::Result<Config> {
     Config::load(dir.join("config.toml"))
 }
@@ -245,6 +301,16 @@ fn print_job_status(status: &JobStatus) {
     println!("round: {}", status.round);
     println!("syn_attempts: {}", status.syn_attempts);
     println!("next_index: {}", status.next_index);
+    println!(
+        "progress: {}",
+        riftmap::scanner::human_progress(
+            status.target_count,
+            status.syn_attempts,
+            status.round,
+            status.next_index,
+            status.completed,
+        )
+    );
     println!("progress_percent: {:.2}", status.progress_percent);
     println!(
         "summary: {}",
@@ -332,6 +398,7 @@ fn validation_report(config: &Path, job: &Path) -> anyhow::Result<serde_json::Va
             "source_ip": cfg.network.source_ip.0,
             "provider_egress_mbps": cfg.network.provider_egress_mbps,
             "application_ratio": cfg.network.application_ratio,
+            "dynamic_application_mbps_file": cfg.network.dynamic_application_mbps_file,
             "tc_ratio": cfg.network.tc_ratio,
             "require_tc": cfg.network.require_tc,
             "tc_qdisc": command_json("tc", &["-s", "-j", "qdisc", "show", "dev", &cfg.network.interface]),
@@ -340,6 +407,9 @@ fn validation_report(config: &Path, job: &Path) -> anyhow::Result<serde_json::Va
             "services": cfg.scan.services(),
             "syn_attempts": cfg.scan.syn_attempts,
             "source_port": cfg.scan.source_port,
+            "syn_ttl": cfg.scan.syn_ttl,
+            "syn_window_size": cfg.scan.syn_window_size,
+            "syn_window_scale": cfg.scan.syn_window_scale,
             "connect_timeout_ms": cfg.scan.connect_timeout_ms,
             "banner_timeout_ms": cfg.scan.banner_timeout_ms,
             "banner_concurrency": cfg.scan.banner_concurrency,
@@ -429,6 +499,94 @@ fn optional_display<T: std::fmt::Display>(value: Option<T>) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+fn run_coordinator(
+    config: PathBuf,
+    listen: std::net::SocketAddr,
+    state: PathBuf,
+) -> anyhow::Result<()> {
+    let _ = Config::load(config).context("validate coordinator config")?;
+    let _ = riftmap::distributed::Store::open(&state)?;
+    riftmap::distributed::serve(state, listen)
+}
+
+fn run_worker(
+    coordinator: std::net::SocketAddr,
+    work_dir: PathBuf,
+    worker_id: Option<String>,
+    exit_when_idle: bool,
+) -> anyhow::Result<()> {
+    riftmap::distributed::run_worker(riftmap::distributed::WorkerOptions {
+        coordinator,
+        work_dir,
+        worker_id,
+        exit_when_idle,
+    })
+}
+
+fn run_distributed_command(command: DistributedCommand) -> anyhow::Result<()> {
+    match command {
+        DistributedCommand::CreateScan {
+            config,
+            task_size,
+            state,
+        } => {
+            let cfg = Config::load(config)?;
+            let mut store = riftmap::distributed::Store::open(state)?;
+            let summary = store.create_scan(&cfg, task_size)?;
+            println!("scan_id: {}", summary.scan_id);
+            println!("target_count: {}", summary.target_count);
+            println!("target_digest: {}", summary.target_digest);
+            println!("task_count: {}", summary.task_count);
+            println!("syn_attempts: {}", summary.syn_attempts);
+        }
+        DistributedCommand::Status {
+            scan_id,
+            state,
+            json,
+        } => {
+            let store = riftmap::distributed::Store::open(state)?;
+            let status = store.status(&scan_id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print_distributed_status(&status);
+            }
+        }
+        DistributedCommand::Export {
+            scan_id,
+            state,
+            output,
+        } => {
+            let store = riftmap::distributed::Store::open(state)?;
+            println!("exported: {}", store.export(&scan_id, &output)?);
+            println!("output: {}", output.display());
+        }
+        DistributedCommand::Report { scan_id, state } => {
+            let store = riftmap::distributed::Store::open(state)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.report(&scan_id)?)?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_distributed_status(status: &riftmap::distributed::ScanStatus) {
+    println!("scan_id: {}", status.scan_id);
+    println!("status: {}", status.status);
+    println!("target_count: {}", status.target_count);
+    println!("syn_attempts: {}", status.syn_attempts);
+    println!("tasks_pending: {}", status.tasks_pending);
+    println!("tasks_running: {}", status.tasks_running);
+    println!("tasks_done: {}", status.tasks_done);
+    println!("tasks_failed: {}", status.tasks_failed);
+    println!("results_open: {}", status.results_open);
+    println!("results_closed: {}", status.results_closed);
+    println!("results_unreachable: {}", status.results_unreachable);
+    println!("observations: {}", status.observations);
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -511,6 +669,18 @@ fn main() -> anyhow::Result<()> {
                 serde_json::to_string_pretty(&validation_report(&config, &job)?)?
             );
         }
+        Command::Coordinator {
+            config,
+            listen,
+            state,
+        } => run_coordinator(config, listen, state)?,
+        Command::Worker {
+            coordinator,
+            work_dir,
+            worker_id,
+            exit_when_idle,
+        } => run_worker(coordinator, work_dir, worker_id, exit_when_idle)?,
+        Command::Distributed { command } => run_distributed_command(command)?,
         Command::Job { command } => match command {
             JobCommand::Status { job, json } => {
                 let status = riftmap::ops::job_status(job)?;
