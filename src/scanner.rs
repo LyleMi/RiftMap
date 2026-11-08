@@ -437,6 +437,7 @@ pub fn scan(job: &mut PreparedJob, cfg: &Config) -> anyhow::Result<ScanSummary> 
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn effective_runtime_limit_secs(cfg: &Config) -> Option<u64> {
     let budget = cfg
         .budget
@@ -451,6 +452,7 @@ fn effective_runtime_limit_secs(cfg: &Config) -> Option<u64> {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn banner_pipeline(
     job_dir: PathBuf,
@@ -464,9 +466,8 @@ async fn banner_pipeline(
 ) -> anyhow::Result<()> {
     use tokio::{sync::Semaphore, task::JoinSet, time};
     let sem = Arc::new(Semaphore::new(cfg.scan.banner_concurrency));
-    let base_interval = Duration::from_secs_f64(
-        1.0 / f64::from(cfg.scan.banner_connects_per_second),
-    );
+    let base_interval =
+        Duration::from_secs_f64(1.0 / f64::from(cfg.scan.banner_connects_per_second));
     let mut ticker = time::interval(base_interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut tasks = JoinSet::new();
@@ -517,6 +518,7 @@ async fn banner_pipeline(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn drain_completed_banner_tasks(
     tasks: &mut tokio::task::JoinSet<anyhow::Result<(usize, crate::ResultV1)>>,
     job_dir: &std::path::Path,
@@ -542,6 +544,7 @@ async fn drain_completed_banner_tasks(
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct OpenTarget {
     index: usize,
     ip: Ipv4Addr,
@@ -557,10 +560,12 @@ struct SynObservation {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct AsyncTokenBucket {
     limiter: SharedBandwidthLimiter,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl AsyncTokenBucket {
     #[cfg(test)]
     fn new(bucket: crate::rate::TokenBucket, start: std::time::Instant) -> Self {
@@ -590,6 +595,7 @@ struct SharedBandwidthLimiter {
     inner: Arc<std::sync::Mutex<BandwidthLimiter>>,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl SharedBandwidthLimiter {
     fn new(cfg: &Config, start: Instant) -> Self {
         let configured_bps = application_bytes_per_second(cfg);
@@ -695,6 +701,7 @@ fn read_dynamic_application_bps(path: &std::path::Path) -> Option<f64> {
 
 const TOKEN_BUCKET_BURST_SECONDS: f64 = 0.1;
 const DYNAMIC_BANDWIDTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const MAX_INTERRUPTIBLE_SLEEP: Duration = Duration::from_millis(100);
 
 struct BannerObservation {
@@ -703,6 +710,7 @@ struct BannerObservation {
     parsed: Option<crate::protocol::ParsedBanner>,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn inspect_banner(
     scan_id: &str,
     ip: Ipv4Addr,
@@ -752,12 +760,10 @@ async fn inspect_banner(
             {
                 ssh.probe_mode = Some(ssh_probe_mode_name(scan.ssh.probe_mode).into());
             }
-            if observation.status == crate::BannerStatus::Ok {
+            if observation.status == crate::BannerStatus::Ok
+                || terminal_banner_status(observation.status)
+            {
                 break;
-            } else {
-                if terminal_banner_status(observation.status) {
-                    break;
-                }
             }
         }
         if terminal_banner_status(observation.status) {
@@ -973,6 +979,7 @@ fn ssh_probe_mode_name(mode: crate::config::SshProbeMode) -> &'static str {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn connect_banner(
     ip: Ipv4Addr,
     source_ip: Ipv4Addr,
@@ -993,6 +1000,7 @@ async fn connect_banner(
     })
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn read_banner(
     stream: &mut tokio::net::TcpStream,
     scan: &crate::config::ScanConfig,
@@ -1019,6 +1027,7 @@ async fn read_banner(
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn banner_completion(
     scan: &crate::config::ScanConfig,
     service: crate::config::ServiceConfig,
@@ -1034,6 +1043,7 @@ fn banner_completion(
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn terminal_banner_status(status: crate::BannerStatus) -> bool {
     matches!(
         status,
@@ -1872,7 +1882,10 @@ mod linux {
         Ok(())
     }
 
-    fn capture_socket(cfg: &Config, source_ip: Ipv4Addr) -> anyhow::Result<pcap::Capture<pcap::Active>> {
+    fn capture_socket(
+        cfg: &Config,
+        source_ip: Ipv4Addr,
+    ) -> anyhow::Result<pcap::Capture<pcap::Active>> {
         let mut cap = pcap::Capture::from_device(cfg.network.interface.as_str())?
             .promisc(false)
             .immediate_mode(true)
@@ -2729,7 +2742,8 @@ mod linux {
             let secret = [7; 32];
             let mut scan = scan_config();
             scan.source_port = 0;
-            let source_port = local_source_port(scan.source_port, &secret, src, remote, scan.port, 0);
+            let source_port =
+                local_source_port(scan.source_port, &secret, src, remote, scan.port, 0);
             let cookie = packet::syn_cookie(&secret, src, remote, source_port, scan.port);
             let tcp = tcp_segment(scan.port, source_port, 0, cookie.wrapping_add(1), 0x12);
             let packet = ethernet_ipv4(ipv4_packet(6, remote, src, &tcp));
